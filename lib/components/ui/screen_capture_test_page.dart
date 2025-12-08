@@ -1,0 +1,253 @@
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+
+import '../../services/screen_capture_service.dart';
+import '../../utils/platform_utils.dart';
+
+class ScreenCaptureTestPage extends StatefulWidget {
+  const ScreenCaptureTestPage({super.key});
+
+  @override
+  State<ScreenCaptureTestPage> createState() => _ScreenCaptureTestPageState();
+}
+
+class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
+  /// 左侧截图结果
+  Uint8List? _leftImage;
+  
+  /// 右侧指定图片（这里使用一个默认的 Flutter 图标）
+  Uint8List? _rightImage;
+  
+  /// 运行中的窗口列表（仅 Windows）
+  List<String> _windows = [];
+  
+  /// 选中的窗口名称
+  String? _selectedWindow;
+  
+  /// 是否正在截图
+  bool _isCapturing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    
+    // Windows 平台加载窗口列表
+    if (PlatformUtils.isWindows) {
+      _loadWindows();
+    }
+  }
+
+  /// 加载运行中的窗口列表（仅 Windows）
+  Future<void> _loadWindows() async {
+    final windows = await ScreenCaptureService.getRunningWindows();
+    setState(() {
+      _windows = windows;
+      if (windows.isNotEmpty) {
+        _selectedWindow = windows.first;
+      }
+    });
+  }
+
+  /// 截取当前屏幕
+  Future<void> _captureScreen() async {
+    setState(() {
+      _isCapturing = true;
+    });
+
+    try {
+      final image = await ScreenCaptureService.captureScreen();
+      setState(() {
+        _leftImage = image;
+      });
+    } catch (e) {
+      print('Error capturing screen: \$e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to capture screen: \$e')),
+      );
+    } finally {
+      setState(() {
+        _isCapturing = false;
+      });
+    }
+  }
+
+  /// 截取指定窗口（仅 Windows）
+  Future<void> _captureWindow() async {
+    if (!PlatformUtils.isWindows || _selectedWindow == null) return;
+
+    setState(() {
+      _isCapturing = true;
+    });
+
+    try {
+      final image = await ScreenCaptureService.captureWindow(_selectedWindow!);
+      setState(() {
+        _leftImage = image;
+      });
+    } catch (e) {
+      print('Error capturing window: \$e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to capture window: \$e')),
+      );
+    } finally {
+      setState(() {
+        _isCapturing = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Screen Capture Test'),
+      ),
+      body: Column(
+        children: [
+          // 控制按钮区域
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Control Panel',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    ElevatedButton(
+                      onPressed: _captureScreen,
+                      child: _isCapturing
+                          ? const CircularProgressIndicator()
+                          : const Text('Capture Current Screen'),
+                    ),
+                    const SizedBox(width: 12),
+                    if (PlatformUtils.isWindows) ...[
+                      Expanded(
+                        child: DropdownButtonFormField<String>(
+                          value: _selectedWindow,
+                          decoration: const InputDecoration(
+                            labelText: 'Select Window',
+                            border: OutlineInputBorder(),
+                          ),
+                          items: _windows.map((window) {
+                            return DropdownMenuItem(
+                              value: window,
+                              child: Text(
+                                window,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            );
+                          }).toList(),
+                          onChanged: (value) {
+                            setState(() {
+                              _selectedWindow = value;
+                            });
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      ElevatedButton(
+                        onPressed: _selectedWindow != null ? _captureWindow : null,
+                        child: _isCapturing
+                            ? const CircularProgressIndicator()
+                            : const Text('Capture Window'),
+                      ),
+                    ],
+                  ],
+                ),
+              ],
+            ),
+          ),
+          
+          // 主要内容区域：左右分栏
+          Expanded(
+            child: Row(
+              children: [
+                // 左侧：截取的屏幕图像
+                Expanded(
+                  child: _buildImageDisplay(
+                    title: 'Captured Screen',
+                    image: _leftImage,
+                    placeholder: 'No screen captured yet',
+                  ),
+                ),
+                
+                // 分隔线
+                const VerticalDivider(width: 1, color: Colors.grey),
+                
+                // 右侧：指定图片
+                Expanded(
+                  child: _buildImageDisplay(
+                    title: 'Specified Image',
+                    image: _rightImage,
+                    placeholder: 'No specified image',
+                    // 这里可以添加加载指定图片的逻辑
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 构建图像显示区域
+  Widget _buildImageDisplay({
+    required String title,
+    required Uint8List? image,
+    required String placeholder,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(16.0),
+      color: Colors.grey[100],
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey),
+                borderRadius: BorderRadius.circular(8),
+                color: Colors.white,
+              ),
+              child: image != null
+                  ? Center(
+                      child: Image.memory(
+                        image,
+                        fit: BoxFit.contain,
+                      ),
+                    )
+                  : Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(
+                            Icons.image_not_supported,
+                            size: 64,
+                            color: Colors.grey,
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            placeholder,
+                            style: const TextStyle(color: Colors.grey),
+                          ),
+                        ],
+                      ),
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
