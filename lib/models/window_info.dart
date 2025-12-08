@@ -2,13 +2,13 @@
 class WindowInfo {
   /// 窗口标题
   final String title;
-  
+
   /// 窗口句柄（仅 Windows）
   final int? handle;
-  
+
   /// 窗口可见性
   final bool isVisible;
-  
+
   /// 窗口是否为顶层窗口
   final bool isTopLevel;
 

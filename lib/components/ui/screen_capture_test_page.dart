@@ -15,23 +15,23 @@ class ScreenCaptureTestPage extends StatefulWidget {
 class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 左侧截图结果
   Uint8List? _leftImage;
-  
+
   /// 右侧指定图片（这里使用一个默认的 Flutter 图标）
   Uint8List? _rightImage;
-  
+
   /// 运行中的窗口列表（仅 Windows）
   List<String> _windows = [];
-  
+
   /// 选中的窗口名称
   String? _selectedWindow;
-  
+
   /// 是否正在截图
   bool _isCapturing = false;
 
   @override
   void initState() {
     super.initState();
-    
+
     // Windows 平台加载窗口列表
     if (PlatformUtils.isWindows) {
       _loadWindows();
@@ -41,10 +41,12 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 加载运行中的窗口列表（仅 Windows）
   Future<void> _loadWindows() async {
     final windows = await ScreenCaptureService.getRunningWindows();
+    // Remove duplicate window titles
+    final uniqueWindows = windows.toSet().toList();
     setState(() {
-      _windows = windows;
-      if (windows.isNotEmpty) {
-        _selectedWindow = windows.first;
+      _windows = uniqueWindows;
+      if (uniqueWindows.isNotEmpty) {
+        _selectedWindow = uniqueWindows.first;
       }
     });
   }
@@ -61,14 +63,16 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
         _leftImage = image;
       });
     } catch (e) {
-      print('Error capturing screen: \$e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to capture screen: \$e')),
-      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Failed to capture screen')));
     } finally {
-      setState(() {
-        _isCapturing = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isCapturing = false;
+        });
+      }
     }
   }
 
@@ -86,23 +90,23 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
         _leftImage = image;
       });
     } catch (e) {
-      print('Error capturing window: \$e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to capture window: \$e')),
-      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Failed to capture window')));
     } finally {
-      setState(() {
-        _isCapturing = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isCapturing = false;
+        });
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Screen Capture Test'),
-      ),
+      appBar: AppBar(title: const Text('Screen Capture Test')),
       body: Column(
         children: [
           // 控制按钮区域
@@ -128,7 +132,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     if (PlatformUtils.isWindows) ...[
                       Expanded(
                         child: DropdownButtonFormField<String>(
-                          value: _selectedWindow,
+                          initialValue: _selectedWindow,
                           decoration: const InputDecoration(
                             labelText: 'Select Window',
                             border: OutlineInputBorder(),
@@ -151,7 +155,9 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                       ),
                       const SizedBox(width: 12),
                       ElevatedButton(
-                        onPressed: _selectedWindow != null ? _captureWindow : null,
+                        onPressed: _selectedWindow != null
+                            ? _captureWindow
+                            : null,
                         child: _isCapturing
                             ? const CircularProgressIndicator()
                             : const Text('Capture Window'),
@@ -162,7 +168,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
               ],
             ),
           ),
-          
+
           // 主要内容区域：左右分栏
           Expanded(
             child: Row(
@@ -175,10 +181,10 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     placeholder: 'No screen captured yet',
                   ),
                 ),
-                
+
                 // 分隔线
                 const VerticalDivider(width: 1, color: Colors.grey),
-                
+
                 // 右侧：指定图片
                 Expanded(
                   child: _buildImageDisplay(
@@ -221,12 +227,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                 color: Colors.white,
               ),
               child: image != null
-                  ? Center(
-                      child: Image.memory(
-                        image,
-                        fit: BoxFit.contain,
-                      ),
-                    )
+                  ? Center(child: Image.memory(image, fit: BoxFit.contain))
                   : Center(
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
