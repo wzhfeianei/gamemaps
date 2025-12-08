@@ -50,8 +50,27 @@ std::vector<uint8_t> CaptureWindowImage(HWND hwnd) {
   // Capture the window
   bool success = false;
   
-  if (hwnd == GetDesktopWindow()) {
-    // For desktop, use BitBlt to capture the screen content
+  // Check if it's a fullscreen window in the foreground
+  // If so, we might need to capture the screen directly to avoid black screen issues with PrintWindow
+  // in exclusive fullscreen games (though GDI BitBlt might still fail in true exclusive mode,
+  // it works better for "optimized" fullscreen)
+  bool is_fullscreen_foreground = false;
+  if (hwnd != GetDesktopWindow()) {
+    HWND foreground_hwnd = GetForegroundWindow();
+    if (hwnd == foreground_hwnd) {
+      // Get screen size
+      int screen_w = GetSystemMetrics(SM_CXSCREEN);
+      int screen_h = GetSystemMetrics(SM_CYSCREEN);
+      
+      if (width >= screen_w && height >= screen_h) {
+        is_fullscreen_foreground = true;
+      }
+    }
+  }
+  
+  if (hwnd == GetDesktopWindow() || is_fullscreen_foreground) {
+    // For desktop or fullscreen foreground window, use BitBlt from screen DC
+    // This is more reliable for fullscreen games than PrintWindow
     success = BitBlt(hdcMem, 0, 0, width, height, hdcScreen, rect.left, rect.top, SRCCOPY);
   } else {
     // For specific windows, use PrintWindow to capture the window content (even if obscured)
@@ -127,6 +146,7 @@ struct WindowEnumData {
   std::vector<std::string>* window_titles;
   HWND target_hwnd;
   const std::string* target_title;
+  long max_area = 0; // To store the area of the largest window found
 };
 
 // Window enumeration callback function
@@ -150,13 +170,33 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lparam) {
   // If we're looking for a specific window
   if (data->target_title != nullptr) {
     if (title_utf8 == *data->target_title) {
-      data->target_hwnd = hwnd;
-      return FALSE; // Stop enumeration
+      // Calculate window area
+      RECT rect;
+      if (GetWindowRect(hwnd, &rect)) {
+        long width = rect.right - rect.left;
+        long height = rect.bottom - rect.top;
+        long area = width * height;
+        
+        // Filter out very small windows (likely utility/hidden windows)
+        // e.g., 10x10 pixels or smaller
+        if (width > 10 && height > 10) {
+          // Keep the largest window found so far
+          if (area > data->max_area) {
+            data->max_area = area;
+            data->target_hwnd = hwnd;
+          }
+        }
+      }
+      
+      // Continue enumeration to find potentially larger windows with the same name
+      return TRUE;
     }
   }
   
   // Otherwise, add to the list
   if (data->window_titles != nullptr) {
+    // Avoid duplicates in the list if possible, or just add all
+    // Here we just add all visible windows with titles
     data->window_titles->push_back(title_utf8);
   }
   
