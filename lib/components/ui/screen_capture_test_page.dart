@@ -1,5 +1,7 @@
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../../services/screen_capture_service.dart';
@@ -103,6 +105,35 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
+  /// 选择并显示指定图片
+  Future<void> _pickImage() async {
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+      );
+
+      if (result != null) {
+        if (result.files.single.bytes != null) {
+          setState(() {
+            _rightImage = result.files.single.bytes;
+          });
+        } else if (result.files.single.path != null) {
+          final file = File(result.files.single.path!);
+          final bytes = await file.readAsBytes();
+          setState(() {
+            _rightImage = bytes;
+          });
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to pick image')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -192,6 +223,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     image: _rightImage,
                     placeholder: 'No specified image',
                     // 这里可以添加加载指定图片的逻辑
+                    onPickImage: _pickImage,
                   ),
                 ),
               ],
@@ -207,6 +239,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     required String title,
     required Uint8List? image,
     required String placeholder,
+    VoidCallback? onPickImage,
   }) {
     return Container(
       padding: const EdgeInsets.all(16.0),
@@ -214,9 +247,20 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            title,
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              if (onPickImage != null)
+                TextButton.icon(
+                  onPressed: onPickImage,
+                  icon: const Icon(Icons.folder_open),
+                  label: const Text('Select Image'),
+                ),
+            ],
           ),
           const SizedBox(height: 12),
           Expanded(
