@@ -1,0 +1,10 @@
+CompileFlags:
+  Add:
+    - -Iwindows/flutter/ephemeral
+    - -Iwindows/flutter/ephemeral/cpp_client_wrapper/include
+    - -DNOMINMAX
+    - -DUNICODE
+    - -D_UNICODE
+    - -std=c++17
+  Compiler: clang++
+    

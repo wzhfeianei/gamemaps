@@ -7,7 +7,11 @@
 #include <windows.h>
 
 #include "flutter/generated_plugin_registrant.h"
-#include <flutter/standard_method_codec.h>
+#include "flutter/standard_method_codec.h"
+
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
 
 // Helper function to convert wstring to string
 std::string WStringToString(const std::wstring& wstr) {
@@ -44,7 +48,33 @@ std::vector<uint8_t> CaptureWindowImage(HWND hwnd) {
   HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
   
   // Capture the window
-  BitBlt(hdcMem, 0, 0, width, height, hdcScreen, rect.left, rect.top, SRCCOPY);
+  bool success = false;
+  
+  if (hwnd == GetDesktopWindow()) {
+    // For desktop, use BitBlt to capture the screen content
+    success = BitBlt(hdcMem, 0, 0, width, height, hdcScreen, rect.left, rect.top, SRCCOPY);
+  } else {
+    // For specific windows, use PrintWindow to capture the window content (even if obscured)
+    // Try with PW_RENDERFULLCONTENT (Windows 8.1+) first
+    success = PrintWindow(hwnd, hdcMem, PW_RENDERFULLCONTENT);
+    if (!success) {
+      // Fallback to standard PrintWindow
+      success = PrintWindow(hwnd, hdcMem, 0);
+    }
+    
+    // Fallback to BitBlt if PrintWindow fails completely
+    if (!success) {
+      success = BitBlt(hdcMem, 0, 0, width, height, hdcScreen, rect.left, rect.top, SRCCOPY);
+    }
+  }
+
+  if (!success) {
+    SelectObject(hdcMem, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+    return image_data;
+  }
   
   // Get bitmap info
   BITMAPINFOHEADER bi;

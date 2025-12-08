@@ -2,6 +2,9 @@
 cmake_minimum_required(VERSION 3.14)
 project(gamemaps LANGUAGES CXX)
 
+# Export compile commands for clangd index
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
 set(BINARY_NAME "gamemaps")
