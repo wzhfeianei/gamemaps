@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -11,6 +12,7 @@ import '../../utils/platform_utils.dart';
 
 import 'match_painter.dart';
 import 'crop_painter.dart';
+import 'draw_painter.dart';
 
 class ScreenCaptureTestPage extends StatefulWidget {
   const ScreenCaptureTestPage({super.key});
@@ -27,6 +29,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
   /// 右侧指定图片
   Uint8List? _rightImage;
+  ui.Image? _rightImageObj; // 增加右侧图片对象
+  ByteData? _rightImagePixels; // 增加右侧图片像素数据
 
   /// 运行中的窗口列表（仅 Windows）
   List<String> _windows = [];
@@ -57,6 +61,11 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   Offset? _cropStart; // 图片坐标系
   Offset? _cropEnd; // 图片坐标系
   Offset? _currentMousePos; // 图片坐标系
+
+  /// 绘制提取相关状态
+  bool _isDrawing = false;
+  final List<Offset> _drawPoints = [];
+  bool _useMagneticLasso = false;
 
   @override
   void initState() {
@@ -107,6 +116,23 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _cropStart = null;
       _cropEnd = null;
     });
+  }
+
+  Future<void> _updateRightImage(Uint8List bytes) async {
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    final pixelData = await frame.image.toByteData(
+      format: ui.ImageByteFormat.rawRgba,
+    );
+
+    setState(() {
+      _rightImage = bytes;
+      _rightImageObj = frame.image;
+      _rightImagePixels = pixelData;
+      _isDrawing = false;
+      _drawPoints.clear();
+    });
+    _createTemplate(bytes);
   }
 
   /// 截取当前屏幕
@@ -282,10 +308,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
         }
 
         if (bytes != null) {
-          setState(() {
-            _rightImage = bytes;
-          });
-          _createTemplate(bytes);
+          await _updateRightImage(bytes);
         }
       }
     } catch (e) {
@@ -412,14 +435,212 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
       if (byteData != null) {
         final bytes = byteData.buffer.asUint8List();
+        await _updateRightImage(bytes); // 使用更新后的方法
         setState(() {
-          _rightImage = bytes;
           _isCropping = false;
         });
-        _createTemplate(bytes);
       }
     } catch (e) {
       debugPrint('Crop error: $e');
+    }
+  }
+
+  /// 启动/停止绘制模式
+  void _toggleDrawMode() {
+    if (_rightImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select an image first')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isDrawing = !_isDrawing;
+      _drawPoints.clear();
+      _currentMousePos = null;
+    });
+  }
+
+  /// 磁性套索：寻找吸附点
+  Offset _findSnapPoint(Offset center, int radius) {
+    if (_rightImageObj == null || _rightImagePixels == null) return center;
+
+    int w = _rightImageObj!.width;
+    int h = _rightImageObj!.height;
+    int centerX = center.dx.round();
+    int centerY = center.dy.round();
+
+    // 如果超出范围，直接返回
+    if (centerX < 0 || centerX >= w || centerY < 0 || centerY >= h)
+      return center;
+
+    double maxGradient = -1.0;
+    Offset bestPoint = center;
+
+    // 搜索周围
+    for (int y = centerY - radius; y <= centerY + radius; y++) {
+      for (int x = centerX - radius; x <= centerX + radius; x++) {
+        if (x < 1 || x >= w - 1 || y < 1 || y >= h - 1) continue;
+
+        // 计算梯度 (Sobel 简化版)
+        // Gx = I(x+1, y) - I(x-1, y)
+        // Gy = I(x, y+1) - I(x, y-1)
+        // Gradient = |Gx| + |Gy|
+
+        final cL = _getPixel(x - 1, y);
+        final cR = _getPixel(x + 1, y);
+        final cT = _getPixel(x, y - 1);
+        final cB = _getPixel(x, y + 1);
+
+        double gx = _colorDiff(cL, cR);
+        double gy = _colorDiff(cT, cB);
+        double gradient = gx + gy;
+
+        // 距离中心的距离权重 (越近权重越高)
+        double dist = math.sqrt(
+          math.pow(x - centerX, 2) + math.pow(y - centerY, 2),
+        );
+        if (dist > radius) continue;
+
+        // 稍微倾向于离鼠标近的点
+        double score = gradient / (1 + dist * 0.1);
+
+        if (score > maxGradient) {
+          maxGradient = score;
+          bestPoint = Offset(x.toDouble(), y.toDouble());
+        }
+      }
+    }
+
+    // 如果梯度太小，说明不是边缘，就不吸附
+    if (maxGradient < 50) return center;
+
+    return bestPoint;
+  }
+
+  Color _getPixel(int x, int y) {
+    final offset = (y * _rightImageObj!.width + x) * 4;
+    final r = _rightImagePixels!.getUint8(offset);
+    final g = _rightImagePixels!.getUint8(offset + 1);
+    final b = _rightImagePixels!.getUint8(offset + 2);
+    // alpha 忽略
+    return Color.fromARGB(255, r, g, b);
+  }
+
+  double _colorDiff(Color c1, Color c2) {
+    return (c1.red - c2.red).abs() +
+        (c1.green - c2.green).abs() +
+        (c1.blue - c2.blue).abs().toDouble();
+  }
+
+  /// 提取图标
+  Future<void> _extractIcon() async {
+    if (_drawPoints.length < 3 || _rightImageObj == null) return;
+
+    // 1. 路径平滑与构建
+    final path = Path();
+    path.moveTo(_drawPoints[0].dx, _drawPoints[0].dy);
+
+    // 使用简单的二次贝塞尔曲线连接
+    for (int i = 0; i < _drawPoints.length - 1; i++) {
+      final p0 = _drawPoints[i];
+      final p1 = _drawPoints[i + 1];
+      // 取中点
+      final mid = Offset((p0.dx + p1.dx) / 2, (p0.dy + p1.dy) / 2);
+      path.quadraticBezierTo(p0.dx, p0.dy, mid.dx, mid.dy);
+    }
+    path.lineTo(_drawPoints.last.dx, _drawPoints.last.dy);
+    path.close();
+
+    try {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+
+      // 绘制原图
+      // canvas.drawImage(_rightImageObj!, Offset.zero, Paint());
+      // 不，我们要抠图，所以是先 clip 只有画图
+
+      // 计算 Path 的边界
+      final bounds = path.getBounds();
+
+      // 平移 Canvas，使 Path 的左上角对齐到 (0,0) ?
+      // 或者保持原位，最后只取 bounds 区域
+
+      canvas.clipPath(path);
+      canvas.drawImage(_rightImageObj!, Offset.zero, Paint());
+
+      final picture = recorder.endRecording();
+      // 这里生成的大小还是原图大小，但是只有中间有内容。
+      // 我们想要的是只保留图标部分（裁剪掉透明空白）。
+      // 所以应该创建一个和 bounds 一样大的 canvas，然后平移绘制。
+
+      final recorder2 = ui.PictureRecorder();
+      final canvas2 = Canvas(recorder2);
+
+      // 移动 path 到 (0,0)
+      final shiftedPath = path.shift(-bounds.topLeft);
+      canvas2.clipPath(shiftedPath);
+
+      // 绘制图片，位置偏移 -bounds.topLeft
+      canvas2.drawImage(_rightImageObj!, -bounds.topLeft, Paint());
+
+      final picture2 = recorder2.endRecording();
+
+      final img = await picture2.toImage(
+        bounds.width.toInt(),
+        bounds.height.toInt(),
+      );
+      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+
+      if (byteData != null) {
+        final bytes = byteData.buffer.asUint8List();
+        await _updateRightImage(bytes);
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Icon extracted successfully')),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Extract error: $e');
+    }
+  }
+
+  /// 保存图片到本地
+  Future<void> _saveImage(Uint8List imageBytes, String title) async {
+    try {
+      // 移除标题中的空格，用作默认文件名的一部分
+      final safeTitle = title.replaceAll(' ', '_');
+      String? outputFile = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save $title',
+        fileName: '${safeTitle}_${DateTime.now().millisecondsSinceEpoch}.png',
+        type: FileType.image,
+        allowedExtensions: ['png', 'jpg', 'jpeg'],
+      );
+
+      if (outputFile != null) {
+        // 确保扩展名
+        if (!outputFile.toLowerCase().endsWith('.png') &&
+            !outputFile.toLowerCase().endsWith('.jpg') &&
+            !outputFile.toLowerCase().endsWith('.jpeg')) {
+          outputFile += '.png';
+        }
+
+        final file = File(outputFile);
+        await file.writeAsBytes(imageBytes);
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('Image saved to $outputFile')));
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to save image: $e')));
+      }
     }
   }
 
@@ -452,6 +673,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     if (PlatformUtils.isWindows) ...[
                       Expanded(
                         child: DropdownButtonFormField<String>(
+                          isExpanded: true, // 确保文本过长时自动截断而不是溢出
                           initialValue: _selectedWindow,
                           decoration: const InputDecoration(
                             labelText: 'Select Window',
@@ -466,7 +688,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                               value: window,
                               child: Text(
                                 window,
-                                overflow: TextOverflow.ellipsis,
+                                overflow: TextOverflow.ellipsis, // 溢出显示省略号
                               ),
                             );
                           }).toList(),
@@ -537,6 +759,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
           // 2. 图片显示区域
           Expanded(
             child: Row(
+              crossAxisAlignment:
+                  CrossAxisAlignment.stretch, // Ensure full height for toolbar
               children: [
                 // 左侧：截取的屏幕图像
                 Expanded(
@@ -560,13 +784,75 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     image: _rightImage,
                     placeholder: 'No specified image',
                     onPickImage: _pickImage,
+                    imageObj: _rightImageObj,
+                  ),
+                ),
+
+                // 右侧工具栏（新增）
+                Container(
+                  width: 48, // 工具栏宽度
+                  color: Colors.grey[200],
+                  child: SingleChildScrollView(
+                    child: Column(
+                      children: [
+                        const SizedBox(height: 16),
+                        // 绘制/提取按钮
+                        Tooltip(
+                          message: 'Draw & Extract',
+                          child: IconButton(
+                            onPressed: _isCropping ? null : _toggleDrawMode,
+                            icon: const Icon(Icons.draw),
+                            color: _isDrawing ? Colors.orange : Colors.black54,
+                            style: IconButton.styleFrom(
+                              backgroundColor: _isDrawing
+                                  ? Colors.orange.withOpacity(0.1)
+                                  : null,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        // 磁性套索开关 (仅在绘制模式下显示)
+                        if (_isDrawing) ...[
+                          Tooltip(
+                            message: 'Magnetic Lasso',
+                            child: IconButton(
+                              onPressed: () {
+                                setState(() {
+                                  _useMagneticLasso = !_useMagneticLasso;
+                                });
+                              },
+                              icon: Icon(
+                                _useMagneticLasso
+                                    ? Icons
+                                          .leak_add // 使用 leak_add 作为磁性套索的近似图标
+                                    : Icons.leak_remove,
+                                color: _useMagneticLasso
+                                    ? Colors.blue
+                                    : Colors.black54,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                        ],
+                        // 取消/退出按钮 (仅在绘制模式下显示)
+                        if (_isDrawing)
+                          Tooltip(
+                            message: 'Cancel Drawing',
+                            child: IconButton(
+                              onPressed: _toggleDrawMode,
+                              icon: const Icon(Icons.close),
+                              color: Colors.red,
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ],
             ),
           ),
 
-          // 3. 图片处理工具栏 (新加)
+          // 3. 图片处理工具栏 (旧的底部工具栏)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             color: Colors.grey[100],
@@ -577,8 +863,11 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(width: 10),
+                // 截图按钮
                 ElevatedButton.icon(
-                  onPressed: _isCropping ? null : _startCropMode,
+                  onPressed: _isDrawing
+                      ? null
+                      : (_isCropping ? null : _startCropMode),
                   icon: const Icon(Icons.crop),
                   label: const Text('Screenshot / Crop'),
                   style: ElevatedButton.styleFrom(
@@ -604,6 +893,16 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     child: const Text('Cancel'),
                   ),
                 ],
+                // 移除原来的 Draw 按钮，因为已经移动到右侧
+                const Spacer(), // 占位
+                if (_isDrawing)
+                  const Text(
+                    'Draw loop on right image to extract icon.',
+                    style: TextStyle(
+                      color: Colors.orange,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -688,12 +987,23 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                   fontWeight: FontWeight.bold,
                 ),
               ),
-              if (onPickImage != null)
-                TextButton.icon(
-                  onPressed: onPickImage,
-                  icon: const Icon(Icons.folder_open),
-                  label: const Text('Select Image'),
-                ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (image != null)
+                    IconButton(
+                      icon: const Icon(Icons.save),
+                      tooltip: 'Save Image',
+                      onPressed: () => _saveImage(image, title),
+                    ),
+                  if (onPickImage != null)
+                    TextButton.icon(
+                      onPressed: onPickImage,
+                      icon: const Icon(Icons.folder_open),
+                      label: const Text('Select Image'),
+                    ),
+                ],
+              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -735,33 +1045,44 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                           );
                         }
 
-                        // 如果是左侧且正在裁剪，使用 MouseRegion + GestureDetector
-                        // 否则只是显示
+                        // 内容组件
                         Widget content = SizedBox(
                           width: constraints.maxWidth,
                           height: constraints.maxHeight,
                           child: CustomPaint(
-                            painter: _isCropping && isLeft
-                                ? null // 裁剪时使用 foregroundPainter 覆盖
+                            painter:
+                                (_isCropping && isLeft) ||
+                                    (_isDrawing && !isLeft)
+                                ? null // 交互模式下使用 foregroundPainter
                                 : null,
                             foregroundPainter: _isCropping && isLeft
                                 ? CropPainter(
-                                    image: imageObj!,
+                                    image: imageObj,
                                     start: _cropStart,
                                     end: _cropEnd,
                                     currentPos: _currentMousePos,
                                     pixelData: _leftImagePixels,
                                   )
-                                : (matchResult != null
-                                      ? MatchPainter(
-                                          matchResult: matchResult,
-                                          imageObj: imageObj,
+                                : (_isDrawing && !isLeft
+                                      ? DrawPainter(
+                                          image: imageObj,
+                                          points: List.of(
+                                            _drawPoints,
+                                          ), // Pass a copy to ensure repaint
+                                          currentPos: _currentMousePos,
+                                          pixelData: _rightImagePixels,
                                         )
-                                      : null),
+                                      : (matchResult != null
+                                            ? MatchPainter(
+                                                matchResult: matchResult,
+                                                imageObj: imageObj,
+                                              )
+                                            : null)),
                             child: Image.memory(image, fit: BoxFit.contain),
                           ),
                         );
 
+                        // 交互逻辑
                         if (isLeft && _isCropping) {
                           return MouseRegion(
                             cursor: SystemMouseCursors.precise,
@@ -788,6 +1109,42 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                               },
                               onPanEnd: (details) {
                                 _confirmCrop();
+                              },
+                              child: content,
+                            ),
+                          );
+                        } else if (!isLeft && _isDrawing) {
+                          // 右侧绘制逻辑
+                          return MouseRegion(
+                            cursor: SystemMouseCursors.precise,
+                            onHover: (event) {
+                              setState(() {
+                                _currentMousePos = toImage(event.localPosition);
+                              });
+                            },
+                            child: GestureDetector(
+                              onPanStart: (details) {
+                                final p = toImage(details.localPosition);
+                                setState(() {
+                                  _drawPoints.clear();
+                                  _drawPoints.add(p);
+                                  _currentMousePos = p;
+                                });
+                              },
+                              onPanUpdate: (details) {
+                                final p = toImage(details.localPosition);
+                                Offset finalP = p;
+                                if (_useMagneticLasso) {
+                                  finalP = _findSnapPoint(p, 10); // 搜索半径 10
+                                }
+
+                                setState(() {
+                                  _drawPoints.add(finalP);
+                                  _currentMousePos = finalP; // 放大镜跟随实际点
+                                });
+                              },
+                              onPanEnd: (details) {
+                                _extractIcon();
                               },
                               child: content,
                             ),
