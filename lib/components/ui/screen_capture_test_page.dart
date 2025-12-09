@@ -13,6 +13,7 @@ import '../../utils/platform_utils.dart';
 import 'match_painter.dart';
 import 'crop_painter.dart';
 import 'draw_painter.dart';
+import 'eraser_cursor_painter.dart'; // 引入新创建的 Painter
 
 class ScreenCaptureTestPage extends StatefulWidget {
   const ScreenCaptureTestPage({super.key});
@@ -67,6 +68,18 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   final List<Offset> _drawPoints = [];
   bool _useMagneticLasso = false;
 
+  /// 橡皮擦相关状态
+  bool _isEraserMode = false;
+  double _eraserSize = 20.0; // 默认半径
+  double _eraserTolerance = 30.0; // 默认容差
+  final ValueNotifier<Offset?> _mousePosNotifier = ValueNotifier(
+    null,
+  ); // 用于高性能光标更新
+
+  /// 历史记录栈
+  final List<Uint8List> _undoStack = [];
+  final List<Uint8List> _redoStack = [];
+
   @override
   void initState() {
     super.initState();
@@ -81,6 +94,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   void dispose() {
     _isContinuousCapturing = false; // 停止连续截图
     _template?.dispose();
+    _mousePosNotifier.dispose();
     super.dispose();
   }
 
@@ -118,7 +132,15 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     });
   }
 
-  Future<void> _updateRightImage(Uint8List bytes) async {
+  Future<void> _updateRightImage(
+    Uint8List bytes, {
+    bool pushToUndo = false,
+  }) async {
+    if (pushToUndo && _rightImage != null) {
+      _undoStack.add(_rightImage!);
+      _redoStack.clear(); // 清空重做栈
+    }
+
     final codec = await ui.instantiateImageCodec(bytes);
     final frame = await codec.getNextFrame();
     final pixelData = await frame.image.toByteData(
@@ -129,10 +151,40 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _rightImage = bytes;
       _rightImageObj = frame.image;
       _rightImagePixels = pixelData;
-      _isDrawing = false;
-      _drawPoints.clear();
+
+      // 保持模式状态，不自动退出
+      if (!_isEraserMode) {
+        _isDrawing = false;
+        _drawPoints.clear();
+      }
     });
     _createTemplate(bytes);
+  }
+
+  /// 撤销操作
+  Future<void> _undo() async {
+    if (_undoStack.isEmpty) return;
+
+    // 保存当前状态到重做栈
+    if (_rightImage != null) {
+      _redoStack.add(_rightImage!);
+    }
+
+    final prevImage = _undoStack.removeLast();
+    await _updateRightImage(prevImage, pushToUndo: false);
+  }
+
+  /// 重做操作
+  Future<void> _redo() async {
+    if (_redoStack.isEmpty) return;
+
+    // 保存当前状态到撤销栈
+    if (_rightImage != null) {
+      _undoStack.add(_rightImage!);
+    }
+
+    final nextImage = _redoStack.removeLast();
+    await _updateRightImage(nextImage, pushToUndo: false);
   }
 
   /// 截取当前屏幕
@@ -308,7 +360,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
         }
 
         if (bytes != null) {
-          await _updateRightImage(bytes);
+          await _updateRightImage(bytes, pushToUndo: true);
         }
       }
     } catch (e) {
@@ -328,9 +380,9 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     if (template != null) {
       _template = template;
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Template processed and ready')),
-        );
+        // ScaffoldMessenger.of(context).showSnackBar(
+        //   const SnackBar(content: Text('Template processed and ready')),
+        // );
       }
     } else {
       if (mounted) {
@@ -357,6 +409,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _matchResult = null;
       _matchDuration = null;
       _isCropping = false; // 退出裁剪模式
+      _isEraserMode = false;
+      _isDrawing = false;
     });
 
     await Future.delayed(Duration.zero);
@@ -403,6 +457,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _cropStart = null;
       _cropEnd = null;
       _matchResult = null;
+      _isDrawing = false;
+      _isEraserMode = false;
     });
   }
 
@@ -435,7 +491,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
       if (byteData != null) {
         final bytes = byteData.buffer.asUint8List();
-        await _updateRightImage(bytes); // 使用更新后的方法
+        await _updateRightImage(bytes, pushToUndo: true); // 使用更新后的方法
         setState(() {
           _isCropping = false;
         });
@@ -456,7 +512,24 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
     setState(() {
       _isDrawing = !_isDrawing;
+      _isEraserMode = false; // 互斥
       _drawPoints.clear();
+      _currentMousePos = null;
+    });
+  }
+
+  /// 启动/停止橡皮擦模式
+  void _toggleEraserMode() {
+    if (_rightImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select an image first')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isEraserMode = !_isEraserMode;
+      _isDrawing = false; // 互斥
       _currentMousePos = null;
     });
   }
@@ -556,23 +629,13 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       final recorder = ui.PictureRecorder();
       final canvas = Canvas(recorder);
 
-      // 绘制原图
-      // canvas.drawImage(_rightImageObj!, Offset.zero, Paint());
-      // 不，我们要抠图，所以是先 clip 只有画图
-
       // 计算 Path 的边界
       final bounds = path.getBounds();
-
-      // 平移 Canvas，使 Path 的左上角对齐到 (0,0) ?
-      // 或者保持原位，最后只取 bounds 区域
 
       canvas.clipPath(path);
       canvas.drawImage(_rightImageObj!, Offset.zero, Paint());
 
       final picture = recorder.endRecording();
-      // 这里生成的大小还是原图大小，但是只有中间有内容。
-      // 我们想要的是只保留图标部分（裁剪掉透明空白）。
-      // 所以应该创建一个和 bounds 一样大的 canvas，然后平移绘制。
 
       final recorder2 = ui.PictureRecorder();
       final canvas2 = Canvas(recorder2);
@@ -594,7 +657,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
       if (byteData != null) {
         final bytes = byteData.buffer.asUint8List();
-        await _updateRightImage(bytes);
+        await _updateRightImage(bytes, pushToUndo: true);
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -604,6 +667,84 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       }
     } catch (e) {
       debugPrint('Extract error: $e');
+    }
+  }
+
+  /// 执行魔术擦除 (全局颜色替换)
+  Future<void> _performMagicErase(Offset targetPos) async {
+    if (_rightImagePixels == null || _rightImageObj == null) return;
+
+    final int cx = targetPos.dx.round();
+    final int cy = targetPos.dy.round();
+    final int w = _rightImageObj!.width;
+    final int h = _rightImageObj!.height;
+
+    // 检查边界
+    if (cx < 0 || cx >= w || cy < 0 || cy >= h) return;
+
+    // 获取基准色
+    final baseColor = _getPixel(cx, cy);
+
+    // 复制当前像素数据以便修改
+    final Uint8List newPixels = Uint8List.fromList(
+      _rightImagePixels!.buffer.asUint8List(),
+    );
+
+    bool changed = false;
+    final int totalPixels = w * h;
+
+    // 预计算基准色分量
+    final int rBase = baseColor.red;
+    final int gBase = baseColor.green;
+    final int bBase = baseColor.blue;
+
+    // 阈值平方 (避免开方运算以提高性能)
+    // 原始逻辑: diff <= tolerance * 2.5
+    // 新逻辑: distSq <= (tolerance * 2.5)^2
+    final double threshold = _eraserTolerance * 2.5;
+    final double thresholdSq = threshold * threshold;
+
+    for (int i = 0; i < totalPixels; i++) {
+      final int offset = i * 4;
+      final int pr = newPixels[offset];
+      final int pg = newPixels[offset + 1];
+      final int pb = newPixels[offset + 2];
+      final int pa = newPixels[offset + 3];
+
+      if (pa == 0) continue; // 已经是透明的
+
+      // 计算色差平方 (欧氏距离平方)
+      final int dr = pr - rBase;
+      final int dg = pg - gBase;
+      final int db = pb - bBase;
+      final int distSq = dr * dr + dg * dg + db * db;
+
+      if (distSq <= thresholdSq) {
+        newPixels[offset + 3] = 0; // Alpha = 0
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      // 从像素数据重新生成 Image
+      final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+        newPixels,
+      );
+      final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
+        buffer,
+        width: w,
+        height: h,
+        pixelFormat: ui.PixelFormat.rgba8888,
+      );
+      final codec = await descriptor.instantiateCodec();
+      final frame = await codec.getNextFrame();
+      final img = frame.image;
+
+      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData != null) {
+        final bytes = byteData.buffer.asUint8List();
+        await _updateRightImage(bytes, pushToUndo: true);
+      }
     }
   }
 
@@ -834,16 +975,155 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                           ),
                           const SizedBox(height: 16),
                         ],
-                        // 取消/退出按钮 (仅在绘制模式下显示)
-                        if (_isDrawing)
+
+                        const Divider(indent: 8, endIndent: 8),
+
+                        // 橡皮擦按钮菜单
+                        PopupMenuButton<double>(
+                          tooltip: 'Magic Eraser Size',
+                          icon: Icon(
+                            Icons.cleaning_services, // 橡皮擦图标
+                            color: _isEraserMode
+                                ? Colors.purple
+                                : Colors.black54,
+                          ),
+                          style: IconButton.styleFrom(
+                            backgroundColor: _isEraserMode
+                                ? Colors.purple.withOpacity(0.1)
+                                : null,
+                          ),
+                          onSelected: (size) {
+                            setState(() {
+                              _eraserSize = size;
+                              if (!_isEraserMode) {
+                                _toggleEraserMode();
+                              }
+                            });
+                          },
+                          itemBuilder: (context) => [
+                            const PopupMenuItem(
+                              value: 10.0,
+                              child: Row(
+                                children: [
+                                  Icon(Icons.circle, size: 10),
+                                  SizedBox(width: 8),
+                                  Text('Small (10px)'),
+                                ],
+                              ),
+                            ),
+                            const PopupMenuItem(
+                              value: 30.0,
+                              child: Row(
+                                children: [
+                                  Icon(Icons.circle, size: 20),
+                                  SizedBox(width: 8),
+                                  Text('Medium (30px)'),
+                                ],
+                              ),
+                            ),
+                            const PopupMenuItem(
+                              value: 60.0,
+                              child: Row(
+                                children: [
+                                  Icon(Icons.circle, size: 30),
+                                  SizedBox(width: 8),
+                                  Text('Large (60px)'),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+
+                        if (_isEraserMode) ...[
+                          const SizedBox(height: 8),
+                          // 容差调整 (用简单的 Popup 或 Dialog 可能更好，这里尝试放在 tooltip 或直接 icon 交互)
+                          // 为了简单，我们加一个设置按钮来调容差
                           Tooltip(
-                            message: 'Cancel Drawing',
+                            message: 'Tolerance: ${_eraserTolerance.round()}',
                             child: IconButton(
-                              onPressed: _toggleDrawMode,
+                              icon: const Icon(Icons.tune, size: 20),
+                              onPressed: () {
+                                showDialog(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text('Eraser Tolerance'),
+                                    content: StatefulBuilder(
+                                      builder: (ctx, setDialogState) {
+                                        return Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Text('${_eraserTolerance.round()}'),
+                                            Slider(
+                                              value: _eraserTolerance,
+                                              min: 0,
+                                              max: 100,
+                                              onChanged: (v) {
+                                                setDialogState(() {
+                                                  _eraserTolerance = v;
+                                                });
+                                                setState(() {
+                                                  _eraserTolerance = v;
+                                                });
+                                              },
+                                            ),
+                                          ],
+                                        );
+                                      },
+                                    ),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () => Navigator.pop(ctx),
+                                        child: const Text('Done'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ],
+
+                        const SizedBox(height: 16),
+                        // 撤销/重做
+                        Tooltip(
+                          message: 'Undo',
+                          child: IconButton(
+                            onPressed: _undoStack.isNotEmpty ? _undo : null,
+                            icon: const Icon(Icons.undo),
+                            color: _undoStack.isNotEmpty
+                                ? Colors.black87
+                                : Colors.grey,
+                          ),
+                        ),
+                        Tooltip(
+                          message: 'Redo',
+                          child: IconButton(
+                            onPressed: _redoStack.isNotEmpty ? _redo : null,
+                            icon: const Icon(Icons.redo),
+                            color: _redoStack.isNotEmpty
+                                ? Colors.black87
+                                : Colors.grey,
+                          ),
+                        ),
+
+                        // 取消/退出按钮 (仅在绘制或橡皮擦模式下显示)
+                        if (_isDrawing || _isEraserMode) ...[
+                          const SizedBox(height: 16),
+                          Tooltip(
+                            message: 'Exit Mode',
+                            child: IconButton(
+                              onPressed: () {
+                                setState(() {
+                                  _isDrawing = false;
+                                  _isEraserMode = false;
+                                  _drawPoints.clear();
+                                });
+                              },
                               icon: const Icon(Icons.close),
                               color: Colors.red,
                             ),
                           ),
+                        ],
                       ],
                     ),
                   ),
@@ -856,54 +1136,68 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             color: Colors.grey[100],
-            child: Row(
-              children: [
-                const Text(
-                  'Tools: ',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(width: 10),
-                // 截图按钮
-                ElevatedButton.icon(
-                  onPressed: _isDrawing
-                      ? null
-                      : (_isCropping ? null : _startCropMode),
-                  icon: const Icon(Icons.crop),
-                  label: const Text('Screenshot / Crop'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _isCropping ? Colors.green : null,
-                    foregroundColor: _isCropping ? Colors.white : null,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  const Text(
+                    'Tools: ',
+                    style: TextStyle(fontWeight: FontWeight.bold),
                   ),
-                ),
-                if (_isCropping) ...[
                   const SizedBox(width: 10),
-                  const Text(
-                    'Drag on left image to crop. Release to confirm.',
-                    style: TextStyle(color: Colors.green),
-                  ),
-                  const Spacer(),
-                  TextButton(
-                    onPressed: () {
-                      setState(() {
-                        _isCropping = false;
-                        _cropStart = null;
-                        _cropEnd = null;
-                      });
-                    },
-                    child: const Text('Cancel'),
-                  ),
-                ],
-                // 移除原来的 Draw 按钮，因为已经移动到右侧
-                const Spacer(), // 占位
-                if (_isDrawing)
-                  const Text(
-                    'Draw loop on right image to extract icon.',
-                    style: TextStyle(
-                      color: Colors.orange,
-                      fontWeight: FontWeight.bold,
+                  // 截图按钮
+                  ElevatedButton.icon(
+                    onPressed: _isDrawing || _isEraserMode
+                        ? null
+                        : (_isCropping ? null : _startCropMode),
+                    icon: const Icon(Icons.crop),
+                    label: const Text('Screenshot / Crop'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _isCropping ? Colors.green : null,
+                      foregroundColor: _isCropping ? Colors.white : null,
                     ),
                   ),
-              ],
+                  if (_isCropping) ...[
+                    const SizedBox(width: 10),
+                    const Text(
+                      'Drag on left image to crop. Release to confirm.',
+                      style: TextStyle(color: Colors.green),
+                    ),
+                    const SizedBox(
+                      width: 10,
+                    ), // Add explicit spacing instead of Spacer
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _isCropping = false;
+                          _cropStart = null;
+                          _cropEnd = null;
+                        });
+                      },
+                      child: const Text('Cancel'),
+                    ),
+                  ],
+                  // 移除原来的 Draw 按钮，因为已经移动到右侧
+                  // const Spacer(), // Spacer cannot be used inside ScrollView
+                  const SizedBox(width: 20),
+                  if (_isDrawing)
+                    const Text(
+                      'Draw loop on right image to extract icon.',
+                      style: TextStyle(
+                        color: Colors.orange,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  if (_isEraserMode)
+                    const Text(
+                      'Click to magic erase similar colors.',
+                      style: TextStyle(
+                        color: Colors.purple,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                ],
+              ),
             ),
           ),
           const Divider(height: 1),
@@ -913,47 +1207,50 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
             width: double.infinity,
             padding: const EdgeInsets.all(12.0),
             color: Colors.grey[200],
-            child: Row(
-              children: [
-                const Icon(Icons.info_outline, size: 20, color: Colors.blue),
-                const SizedBox(width: 8),
-                Text(
-                  _matchDuration != null
-                      ? 'Time: ${_matchDuration!.inMilliseconds}ms'
-                      : 'Time: --',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(width: 20),
-                if (_matchResult != null) ...[
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  const Icon(Icons.info_outline, size: 20, color: Colors.blue),
+                  const SizedBox(width: 8),
                   Text(
-                    'Position: (${_matchResult!.x}, ${_matchResult!.y})',
+                    _matchDuration != null
+                        ? 'Time: ${_matchDuration!.inMilliseconds}ms'
+                        : 'Time: --',
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(width: 20),
-                  Text(
-                    'Size: ${_matchResult!.width}x${_matchResult!.height}',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(width: 20),
-                  Text(
-                    'Confidence: ${(_matchResult!.confidence * 100).toStringAsFixed(1)}%',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                ] else if (_matchDuration != null) ...[
-                  const Text(
-                    'Result: No match found',
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: Colors.red,
+                  if (_matchResult != null) ...[
+                    Text(
+                      'Position: (${_matchResult!.x}, ${_matchResult!.y})',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
-                  ),
-                ] else ...[
-                  const Text(
-                    'Ready to match',
-                    style: TextStyle(color: Colors.grey),
-                  ),
+                    const SizedBox(width: 20),
+                    Text(
+                      'Size: ${_matchResult!.width}x${_matchResult!.height}',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(width: 20),
+                    Text(
+                      'Confidence: ${(_matchResult!.confidence * 100).toStringAsFixed(1)}%',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ] else if (_matchDuration != null) ...[
+                    const Text(
+                      'Result: No match found',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: Colors.red,
+                      ),
+                    ),
+                  ] else ...[
+                    const Text(
+                      'Ready to match',
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
         ],
@@ -1052,7 +1349,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                           child: CustomPaint(
                             painter:
                                 (_isCropping && isLeft) ||
-                                    (_isDrawing && !isLeft)
+                                    (_isDrawing && !isLeft) ||
+                                    (_isEraserMode && !isLeft)
                                 ? null // 交互模式下使用 foregroundPainter
                                 : null,
                             foregroundPainter: _isCropping && isLeft
@@ -1072,12 +1370,19 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                           currentPos: _currentMousePos,
                                           pixelData: _rightImagePixels,
                                         )
-                                      : (matchResult != null
-                                            ? MatchPainter(
-                                                matchResult: matchResult,
-                                                imageObj: imageObj,
+                                      : (_isEraserMode && !isLeft
+                                            ? EraserCursorPainter(
+                                                image: imageObj,
+                                                positionNotifier:
+                                                    _mousePosNotifier,
+                                                eraserSize: _eraserSize,
                                               )
-                                            : null)),
+                                            : (matchResult != null
+                                                  ? MatchPainter(
+                                                      matchResult: matchResult,
+                                                      imageObj: imageObj,
+                                                    )
+                                                  : null))),
                             child: Image.memory(image, fit: BoxFit.contain),
                           ),
                         );
@@ -1145,6 +1450,25 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                               },
                               onPanEnd: (details) {
                                 _extractIcon();
+                              },
+                              child: content,
+                            ),
+                          );
+                        } else if (!isLeft && _isEraserMode) {
+                          // 右侧橡皮擦逻辑
+                          return MouseRegion(
+                            cursor: SystemMouseCursors.none, // 隐藏系统光标，使用自定义光标
+                            onHover: (event) {
+                              // 使用 ValueNotifier 更新光标位置，避免 setState 导致的重绘卡顿
+                              _mousePosNotifier.value = toImage(
+                                event.localPosition,
+                              );
+                            },
+                            child: GestureDetector(
+                              onTapDown: (details) {
+                                final p = toImage(details.localPosition);
+                                _mousePosNotifier.value = p;
+                                _performMagicErase(p);
                               },
                               child: content,
                             ),
