@@ -6,14 +6,17 @@ import 'dart:math' as math;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import 'package:opencv_dart/opencv_dart.dart' as cv;
 import '../../services/image_matching_service.dart';
 import '../../services/screen_capture_service.dart';
+import '../../services/image_preprocessor.dart';
 import '../../utils/platform_utils.dart';
 
 import 'match_painter.dart';
 import 'crop_painter.dart';
 import 'draw_painter.dart';
-import 'eraser_cursor_painter.dart'; // 引入新创建的 Painter
+import 'eraser_cursor_painter.dart';
+import 'image_editor_painter.dart'; // 引入新的编辑器 Painter
 
 class ScreenCaptureTestPage extends StatefulWidget {
   const ScreenCaptureTestPage({super.key});
@@ -75,6 +78,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   final ValueNotifier<Offset?> _mousePosNotifier = ValueNotifier(
     null,
   ); // 用于高性能光标更新
+  final List<Offset> _eraserPathPoints = []; // 橡皮擦移动路径
 
   /// 历史记录栈
   final List<Uint8List> _undoStack = [];
@@ -156,6 +160,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       if (!_isEraserMode) {
         _isDrawing = false;
         _drawPoints.clear();
+      } else {
+        _eraserPathPoints.clear(); // 清除橡皮擦路径
       }
     });
     _createTemplate(bytes);
@@ -395,13 +401,31 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
   /// 执行图像匹配
   Future<void> _matchImages() async {
-    if (_leftImage == null || _template == null) {
+    // 允许点击，内部具体判断是缺左图还是缺模板
+    if (_leftImage == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please capture screen and select image first'),
-        ),
+        const SnackBar(content: Text('Please capture screen first')),
       );
       return;
+    }
+
+    if (_template == null) {
+      // 尝试重新创建模板 (如果是刚刚更新了右图但创建失败)
+      if (_rightImage != null) {
+        _createTemplate(_rightImage!);
+      }
+
+      // 再次检查
+      if (_template == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Template not ready. Please select/edit right image again.',
+            ),
+          ),
+        );
+        return;
+      }
     }
 
     setState(() {
@@ -501,6 +525,53 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
+  /// 执行智能图像预处理
+  Future<void> _performSmartPreprocess() async {
+    if (_rightImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select an image first')),
+      );
+      return;
+    }
+
+    try {
+      // 1. 解码为 Mat
+      final mat = cv.imdecode(_rightImage!, cv.IMREAD_UNCHANGED);
+      if (mat.isEmpty) return;
+
+      // 2. 调用预处理
+      final processedMat = ImagePreprocessor.smartFillBackground(mat);
+
+      // 3. 编码回 PNG
+      // 注意：processedMat 是单通道灰度图
+      final success = cv.imencode('.png', processedMat);
+
+      // 释放资源
+      mat.dispose();
+      processedMat.dispose();
+
+      if (success.$1) {
+        // success.$2 是 Uint8List
+        await _updateRightImage(success.$2, pushToUndo: true);
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Smart preprocessing applied (Background Filled)'),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Smart preprocess error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error preprocessing image: $e')),
+        );
+      }
+    }
+  }
+
   /// 启动/停止绘制模式
   void _toggleDrawMode() {
     if (_rightImage == null) {
@@ -531,6 +602,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _isEraserMode = !_isEraserMode;
       _isDrawing = false; // 互斥
       _currentMousePos = null;
+      _eraserPathPoints.clear();
     });
   }
 
@@ -670,7 +742,88 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
-  /// 执行魔术擦除 (全局颜色替换)
+  /// 应用橡皮擦路径到像素数据 (拖拽结束时调用)
+  Future<void> _applyEraserPathToPixels() async {
+    if (_eraserPathPoints.isEmpty ||
+        _rightImagePixels == null ||
+        _rightImageObj == null)
+      return;
+
+    final int w = _rightImageObj!.width;
+    final int h = _rightImageObj!.height;
+    final int r = _eraserSize.round();
+    final int rSq = r * r;
+
+    // 复制像素数据
+    final Uint8List newPixels = Uint8List.fromList(
+      _rightImagePixels!.buffer.asUint8List(),
+    );
+    bool changed = false;
+
+    // 遍历路径点，插值处理以防止快速移动产生间隙
+    if (_eraserPathPoints.length == 1) {
+      _eraseSquare(newPixels, _eraserPathPoints[0], w, h, r);
+      changed = true;
+    } else {
+      for (int i = 0; i < _eraserPathPoints.length - 1; i++) {
+        final p1 = _eraserPathPoints[i];
+        final p2 = _eraserPathPoints[i + 1];
+
+        // 计算两点距离
+        final double dist = (p1 - p2).distance;
+        // 步长取半径的 1/4 或 1 像素，取大者以平衡性能
+        final double step = math.max(1.0, r / 4.0);
+
+        double currentDist = 0.0;
+        while (currentDist <= dist) {
+          // 线性插值
+          final double t = dist == 0 ? 0 : currentDist / dist;
+          final Offset p = Offset.lerp(p1, p2, t)!;
+
+          if (_eraseSquare(newPixels, p, w, h, r)) {
+            changed = true;
+          }
+          currentDist += step;
+        }
+      }
+      // 确保最后一个点被处理
+      if (_eraseSquare(newPixels, _eraserPathPoints.last, w, h, r)) {
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await _updatePixels(newPixels, w, h);
+      setState(() {
+        _eraserPathPoints.clear();
+      });
+    }
+  }
+
+  /// 辅助函数：擦除单个正方形区域
+  bool _eraseSquare(Uint8List pixels, Offset center, int w, int h, int r) {
+    bool changed = false;
+    final int cx = center.dx.round();
+    final int cy = center.dy.round();
+
+    // 遍历正方形区域 [cx-r, cx+r]
+    for (int y = cy - r; y <= cy + r; y++) {
+      if (y < 0 || y >= h) continue;
+      for (int x = cx - r; x <= cx + r; x++) {
+        if (x < 0 || x >= w) continue;
+        // 正方形不需要额外的距离判断
+
+        final int offset = (y * w + x) * 4;
+        if (pixels[offset + 3] != 0) {
+          pixels[offset + 3] = 0; // Alpha = 0
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  /// 执行魔术擦除 (点击时调用：覆盖区域擦除 + 全局颜色替换)
   Future<void> _performMagicErase(Offset targetPos) async {
     if (_rightImagePixels == null || _rightImageObj == null) return;
 
@@ -682,7 +835,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     // 检查边界
     if (cx < 0 || cx >= w || cy < 0 || cy >= h) return;
 
-    // 获取基准色
+    // 1. 获取基准色 (在擦除前获取)
     final baseColor = _getPixel(cx, cy);
 
     // 复制当前像素数据以便修改
@@ -698,22 +851,39 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     final int gBase = baseColor.green;
     final int bBase = baseColor.blue;
 
-    // 阈值平方 (避免开方运算以提高性能)
-    // 原始逻辑: diff <= tolerance * 2.5
-    // 新逻辑: distSq <= (tolerance * 2.5)^2
+    // 阈值平方
     final double threshold = _eraserTolerance * 2.5;
     final double thresholdSq = threshold * threshold;
 
+    // 2. 擦除覆盖区域 (Square) - 优先执行
+    final int r = _eraserSize.round();
+    // final int rSq = r * r; // 不再需要平方
+    for (int y = cy - r; y <= cy + r; y++) {
+      if (y < 0 || y >= h) continue;
+      for (int x = cx - r; x <= cx + r; x++) {
+        if (x < 0 || x >= w) continue;
+        // if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > rSq) continue; // 移除圆判断
+
+        final int offset = (y * w + x) * 4;
+        if (newPixels[offset + 3] != 0) {
+          newPixels[offset + 3] = 0;
+          changed = true;
+        }
+      }
+    }
+
+    // 3. 全局颜色替换
     for (int i = 0; i < totalPixels; i++) {
       final int offset = i * 4;
-      final int pr = newPixels[offset];
-      final int pg = newPixels[offset + 1];
-      final int pb = newPixels[offset + 2];
       final int pa = newPixels[offset + 3];
 
       if (pa == 0) continue; // 已经是透明的
 
-      // 计算色差平方 (欧氏距离平方)
+      final int pr = newPixels[offset];
+      final int pg = newPixels[offset + 1];
+      final int pb = newPixels[offset + 2];
+
+      // 计算色差平方
       final int dr = pr - rBase;
       final int dg = pg - gBase;
       final int db = pb - bBase;
@@ -726,25 +896,29 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
 
     if (changed) {
-      // 从像素数据重新生成 Image
-      final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
-        newPixels,
-      );
-      final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
-        buffer,
-        width: w,
-        height: h,
-        pixelFormat: ui.PixelFormat.rgba8888,
-      );
-      final codec = await descriptor.instantiateCodec();
-      final frame = await codec.getNextFrame();
-      final img = frame.image;
+      await _updatePixels(newPixels, w, h);
+    }
+  }
 
-      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
-      if (byteData != null) {
-        final bytes = byteData.buffer.asUint8List();
-        await _updateRightImage(bytes, pushToUndo: true);
-      }
+  Future<void> _updatePixels(Uint8List newPixels, int w, int h) async {
+    // 从像素数据重新生成 Image
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+      newPixels,
+    );
+    final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
+      buffer,
+      width: w,
+      height: h,
+      pixelFormat: ui.PixelFormat.rgba8888,
+    );
+    final codec = await descriptor.instantiateCodec();
+    final frame = await codec.getNextFrame();
+    final img = frame.image;
+
+    final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+    if (byteData != null) {
+      final bytes = byteData.buffer.asUint8List();
+      await _updateRightImage(bytes, pushToUndo: true);
     }
   }
 
@@ -870,12 +1044,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     ],
                     const SizedBox(width: 12),
                     ElevatedButton(
-                      onPressed:
-                          (_leftImage != null &&
-                              _template != null &&
-                              !_isMatching)
-                          ? _matchImages
-                          : null,
+                      onPressed: !_isMatching ? _matchImages : null,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.blue,
                         foregroundColor: Colors.white,
@@ -976,13 +1145,24 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                           const SizedBox(height: 16),
                         ],
 
+                        // 智能预处理按钮
+                        Tooltip(
+                          message: 'Smart Preprocess (Fill Background)',
+                          child: IconButton(
+                            onPressed: _performSmartPreprocess,
+                            icon: const Icon(Icons.auto_fix_high),
+                            color: Colors.blue,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+
                         const Divider(indent: 8, endIndent: 8),
 
-                        // 橡皮擦按钮菜单
-                        PopupMenuButton<double>(
-                          tooltip: 'Magic Eraser Size',
+                        // 橡皮擦按钮菜单 (使用 MenuAnchor 或 PopupMenuButton 包含 Slider)
+                        PopupMenuButton<void>(
+                          tooltip: 'Eraser Size',
                           icon: Icon(
-                            Icons.cleaning_services, // 橡皮擦图标
+                            Icons.cleaning_services,
                             color: _isEraserMode
                                 ? Colors.purple
                                 : Colors.black54,
@@ -992,46 +1172,65 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                 ? Colors.purple.withOpacity(0.1)
                                 : null,
                           ),
-                          onSelected: (size) {
-                            setState(() {
-                              _eraserSize = size;
-                              if (!_isEraserMode) {
-                                _toggleEraserMode();
-                              }
-                            });
-                          },
+
+                          // 点击图标直接切换模式
+                          // 为了实现"点击切换模式，长按或点击箭头调大小"，这里稍微变通一下
+                          // PopupMenuButton 默认点击就打开菜单。
+                          // 我们让它点击打开菜单，菜单里有 Slider 和 模式切换说明?
+                          // 或者简单的: 既然用户主要想调大小，点击就打开大小调节器。
+                          // 如果想切换模式，可以在菜单里选? 或者保留点击行为是切换模式?
+                          // 这里的实现：点击图标打开菜单，菜单里有 Slider。
+                          // 另外单独加一个按钮切换模式? 不，用户习惯是点击图标切换模式。
+                          // 我们把 Slider 放在 PopupMenu 里，但是需要保持菜单不关闭?
+                          // 更好的方式：使用 GestureDetector 包裹图标，点击切换模式，长按弹出 Slider?
+                          // 或者：点击图标 -> 切换模式。
+                          // 右边加一个小箭头 -> 弹出 Slider。
+                          // 现在的实现：PopupMenuButton 占用一个图标位。
+                          // 我们改为：点击图标 -> 切换模式。
+                          // 图标下面(或旁边)加一个 Slider? 空间不够。
+                          // 遵循用户要求：改用 Slider 来确定大小。
+                          // 可以在点击后弹出的菜单中放 Slider。
                           itemBuilder: (context) => [
-                            const PopupMenuItem(
-                              value: 10.0,
-                              child: Row(
-                                children: [
-                                  Icon(Icons.circle, size: 10),
-                                  SizedBox(width: 8),
-                                  Text('Small (10px)'),
-                                ],
-                              ),
-                            ),
-                            const PopupMenuItem(
-                              value: 30.0,
-                              child: Row(
-                                children: [
-                                  Icon(Icons.circle, size: 20),
-                                  SizedBox(width: 8),
-                                  Text('Medium (30px)'),
-                                ],
-                              ),
-                            ),
-                            const PopupMenuItem(
-                              value: 60.0,
-                              child: Row(
-                                children: [
-                                  Icon(Icons.circle, size: 30),
-                                  SizedBox(width: 8),
-                                  Text('Large (60px)'),
-                                ],
+                            PopupMenuItem<void>(
+                              enabled: false, // 不可点击关闭
+                              child: StatefulBuilder(
+                                builder: (context, setState) {
+                                  return SizedBox(
+                                    width: 200,
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text('Size: ${_eraserSize.round()}'),
+                                        Slider(
+                                          value: _eraserSize,
+                                          min: 1.0,
+                                          max: 100.0,
+                                          onChanged: (value) {
+                                            setState(() {
+                                              _eraserSize = value;
+                                            });
+                                            // 同步更新外部状态
+                                            this.setState(() {
+                                              _eraserSize = value;
+                                              if (!_isEraserMode) {
+                                                _toggleEraserMode();
+                                              }
+                                            });
+                                          },
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
                               ),
                             ),
                           ],
+                          onOpened: () {
+                            // 打开菜单时自动切换到橡皮擦模式
+                            if (!_isEraserMode) {
+                              _toggleEraserMode();
+                            }
+                          },
                         ),
 
                         if (_isEraserMode) ...[
@@ -1348,10 +1547,13 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                           height: constraints.maxHeight,
                           child: CustomPaint(
                             painter:
-                                (_isCropping && isLeft) ||
-                                    (_isDrawing && !isLeft) ||
-                                    (_isEraserMode && !isLeft)
-                                ? null // 交互模式下使用 foregroundPainter
+                                (_isEraserMode && !isLeft && imageObj != null)
+                                ? ImageEditorPainter(
+                                    image: imageObj,
+                                    eraserPath: List.of(_eraserPathPoints),
+                                    eraserSize: _eraserSize,
+                                    positionNotifier: _mousePosNotifier,
+                                  )
                                 : null,
                             foregroundPainter: _isCropping && isLeft
                                 ? CropPainter(
@@ -1370,20 +1572,15 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                           currentPos: _currentMousePos,
                                           pixelData: _rightImagePixels,
                                         )
-                                      : (_isEraserMode && !isLeft
-                                            ? EraserCursorPainter(
-                                                image: imageObj,
-                                                positionNotifier:
-                                                    _mousePosNotifier,
-                                                eraserSize: _eraserSize,
+                                      : (matchResult != null
+                                            ? MatchPainter(
+                                                matchResult: matchResult,
+                                                imageObj: imageObj,
                                               )
-                                            : (matchResult != null
-                                                  ? MatchPainter(
-                                                      matchResult: matchResult,
-                                                      imageObj: imageObj,
-                                                    )
-                                                  : null))),
-                            child: Image.memory(image, fit: BoxFit.contain),
+                                            : null)),
+                            child: (_isEraserMode && !isLeft)
+                                ? const SizedBox.expand()
+                                : Image.memory(image, fit: BoxFit.contain),
                           ),
                         );
 
@@ -1465,7 +1662,24 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                               );
                             },
                             child: GestureDetector(
-                              onTapDown: (details) {
+                              onPanStart: (details) {
+                                final p = toImage(details.localPosition);
+                                setState(() {
+                                  _eraserPathPoints.add(p);
+                                });
+                                _mousePosNotifier.value = p;
+                              },
+                              onPanUpdate: (details) {
+                                final p = toImage(details.localPosition);
+                                setState(() {
+                                  _eraserPathPoints.add(p);
+                                });
+                                _mousePosNotifier.value = p;
+                              },
+                              onPanEnd: (details) {
+                                _applyEraserPathToPixels();
+                              },
+                              onTapUp: (details) {
                                 final p = toImage(details.localPosition);
                                 _mousePosNotifier.value = p;
                                 _performMagicErase(p);

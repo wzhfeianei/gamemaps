@@ -2,6 +2,8 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
+import 'image_preprocessor.dart';
+
 class MatchResult {
   // 使用自定义的 Rect 数据结构，确保跨 Isolate 安全
   final int x;
@@ -31,6 +33,9 @@ class MatchResult {
 class ImageTemplate {
   final cv.Mat gray;
   final cv.Mat graySmall;
+  final cv.Mat graySmallFilled; // 智能填充背景的缩略图 (无 Mask)
+  final cv.Mat? mask;
+  final cv.Mat? maskSmall;
   final double scale;
   final int originalWidth;
   final int originalHeight;
@@ -38,6 +43,9 @@ class ImageTemplate {
   ImageTemplate._({
     required this.gray,
     required this.graySmall,
+    required this.graySmallFilled,
+    this.mask,
+    this.maskSmall,
     required this.scale,
     required this.originalWidth,
     required this.originalHeight,
@@ -48,9 +56,41 @@ class ImageTemplate {
   /// [scale] 缩放比例，默认为 0.5
   static ImageTemplate? create(Uint8List bytes, {double scale = 0.5}) {
     try {
-      // 直接解码为灰度图
-      final gray = cv.imdecode(bytes, cv.IMREAD_GRAYSCALE);
-      if (gray.isEmpty) return null;
+      // 读取包含 Alpha 通道的原图
+      final src = cv.imdecode(bytes, cv.IMREAD_UNCHANGED);
+      if (src.isEmpty) return null;
+
+      cv.Mat gray;
+      cv.Mat? mask;
+
+      // 检查通道数
+      if (src.channels == 4) {
+        // 分离通道
+        final channels = cv.split(src);
+        // Alpha 通道作为 Mask
+        mask = channels[3];
+        // 将 BGR/RGB 转换为灰度
+        // 注意：imdecode 默认是 BGR 顺序 (OpenCV 习惯)
+        // 这里的转换代码取决于 opencv_dart 的实现，通常 split 后前三个是 BGR
+        // 但我们可以直接把 src (BGRA) 转为 Gray
+        gray = cv.cvtColor(src, cv.COLOR_BGRA2GRAY);
+
+        // 释放拆分出的通道 (mask 已经被引用，其他的释放)
+        channels[0].dispose();
+        channels[1].dispose();
+        channels[2].dispose();
+        // channels[3] is mask, keep it.
+      } else {
+        // 如果没有 Alpha，直接转灰度 (或者已经是灰度)
+        if (src.channels == 3) {
+          gray = cv.cvtColor(src, cv.COLOR_BGR2GRAY);
+        } else {
+          gray = src.clone(); // 已经是单通道
+        }
+      }
+
+      // src 可以释放了，mask 和 gray 已经独立
+      src.dispose();
 
       final width = gray.cols;
       final height = gray.rows;
@@ -63,9 +103,28 @@ class ImageTemplate {
         smallHeight,
       ), interpolation: cv.INTER_LINEAR);
 
+      cv.Mat? maskSmall;
+      if (mask != null) {
+        maskSmall = cv.resize(mask, (
+          smallWidth,
+          smallHeight,
+        ), interpolation: cv.INTER_NEAREST); // Mask 建议用最邻近插值保持边缘
+      }
+
+      // 生成智能填充的缩略图 (用于快速无 Mask 匹配)
+      final graySmallFilled = maskSmall != null
+          ? ImagePreprocessor.smartFillBackgroundFromGrayMask(
+              graySmall,
+              maskSmall,
+            )
+          : graySmall.clone();
+
       return ImageTemplate._(
         gray: gray,
         graySmall: graySmall,
+        graySmallFilled: graySmallFilled,
+        mask: mask,
+        maskSmall: maskSmall,
         scale: scale,
         originalWidth: width,
         originalHeight: height,
@@ -79,6 +138,9 @@ class ImageTemplate {
   void dispose() {
     gray.dispose();
     graySmall.dispose();
+    graySmallFilled.dispose();
+    mask?.dispose();
+    maskSmall?.dispose();
   }
 }
 
@@ -120,10 +182,12 @@ class ImageMatchingService {
       ), interpolation: cv.INTER_LINEAR);
 
       // 执行粗匹配
+      // 优化：使用 graySmallFilled 进行无 Mask 匹配，启用 FFT 加速
       resultSmall = cv.matchTemplate(
         sourceSmall,
-        template.graySmall,
+        template.graySmallFilled, // 使用智能填充的模板
         cv.TM_CCOEFF_NORMED,
+        // mask: template.maskSmall, // 移除 Mask 以提升速度
       );
 
       final minMaxSmall = cv.minMaxLoc(resultSmall);
@@ -179,7 +243,12 @@ class ImageMatchingService {
       roi = sourceGray.region(cv.Rect(roiX, roiY, roiW, roiH));
 
       // 在 ROI 上进行精匹配
-      result = cv.matchTemplate(roi, template.gray, cv.TM_CCOEFF_NORMED);
+      result = cv.matchTemplate(
+        roi,
+        template.gray,
+        cv.TM_CCOEFF_NORMED,
+        mask: template.mask, // 传递 mask
+      );
 
       final minMax = cv.minMaxLoc(result);
       final maxVal = minMax.$2;
