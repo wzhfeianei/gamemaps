@@ -233,6 +233,31 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
+  /// 选择并显示左侧图片（模拟截图）
+  Future<void> _pickLeftImage() async {
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+      );
+
+      if (result != null) {
+        if (result.files.single.bytes != null) {
+          await _updateLeftImage(result.files.single.bytes!);
+        } else if (result.files.single.path != null) {
+          final file = File(result.files.single.path!);
+          final bytes = await file.readAsBytes();
+          await _updateLeftImage(bytes);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Failed to pick image')));
+      }
+    }
+  }
+
   /// 选择并显示指定图片
   Future<void> _pickImage() async {
     try {
@@ -458,6 +483,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     placeholder: 'No screen captured yet',
                     matchResult: _matchResult,
                     imageObj: _leftImageObj,
+                    onPickImage: _pickLeftImage, // 添加选择图片功能
                   ),
                 ),
 
