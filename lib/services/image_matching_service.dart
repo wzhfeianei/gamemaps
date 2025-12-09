@@ -4,6 +4,26 @@ import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 import 'image_preprocessor.dart';
 
+enum MatchingAlgorithm {
+  /// 单尺度 + Mask (原生)
+  /// 速度慢，精度高
+  directMasked,
+
+  /// 单尺度 + 无 Mask (全图)
+  /// 速度极快(FFT)，但不支持透明背景
+  directUnmasked,
+
+  /// 金字塔 + 混合模式 (推荐)
+  /// 粗筛(无Mask) -> 精筛(有Mask)
+  /// 速度快，精度高，兼顾透明背景
+  pyramidHybrid,
+
+  /// 金字塔 + 全 Mask
+  /// 粗筛(有Mask) -> 精筛(有Mask)
+  /// 速度中等，精度最高
+  pyramidMasked,
+}
+
 class MatchResult {
   // 使用自定义的 Rect 数据结构，确保跨 Isolate 安全
   final int x;
@@ -149,11 +169,13 @@ class ImageMatchingService {
   /// [sourceBytes] 源图像数据
   /// [template] 预处理后的模板对象
   /// [threshold] 匹配阈值，默认为 0.8
+  /// [algorithm] 匹配算法，默认为 pyramidHybrid
   /// 返回匹配结果，如果没有找到匹配项则返回 null
   static MatchResult? matchTemplateWithPreload(
     Uint8List sourceBytes,
     ImageTemplate template, {
     double threshold = 0.8,
+    MatchingAlgorithm algorithm = MatchingAlgorithm.pyramidHybrid,
   }) {
     cv.Mat? sourceGray;
     cv.Mat? sourceSmall;
@@ -172,102 +194,130 @@ class ImageMatchingService {
         return null;
       }
 
-      // 2. 粗匹配：将源图像缩小
-      final smallWidth = (sourceGray.cols * template.scale).toInt();
-      final smallHeight = (sourceGray.rows * template.scale).toInt();
+      // 根据算法分发逻辑
+      if (algorithm == MatchingAlgorithm.directMasked ||
+          algorithm == MatchingAlgorithm.directUnmasked) {
+        // --- 单尺度直接匹配 ---
+        result = cv.matchTemplate(
+          sourceGray,
+          template.gray,
+          cv.TM_CCOEFF_NORMED,
+          mask: algorithm == MatchingAlgorithm.directMasked
+              ? template.mask
+              : null,
+        );
 
-      sourceSmall = cv.resize(sourceGray, (
-        smallWidth,
-        smallHeight,
-      ), interpolation: cv.INTER_LINEAR);
+        final minMax = cv.minMaxLoc(result);
+        final maxVal = minMax.$2;
+        final maxLoc = minMax.$4;
 
-      // 执行粗匹配
-      // 优化：使用 graySmallFilled 进行无 Mask 匹配，启用 FFT 加速
-      resultSmall = cv.matchTemplate(
-        sourceSmall,
-        template.graySmallFilled, // 使用智能填充的模板
-        cv.TM_CCOEFF_NORMED,
-        // mask: template.maskSmall, // 移除 Mask 以提升速度
-      );
+        if (maxVal >= threshold) {
+          return MatchResult(
+            x: maxLoc.x,
+            y: maxLoc.y,
+            width: template.originalWidth,
+            height: template.originalHeight,
+            confidence: maxVal,
+          );
+        }
+        return null;
+      } else {
+        // --- 金字塔匹配 (Hybrid / Masked) ---
 
-      final minMaxSmall = cv.minMaxLoc(resultSmall);
-      final maxValSmall = minMaxSmall.$2;
-      final maxLocSmall = minMaxSmall.$4;
+        // 2. 粗匹配：将源图像缩小
+        final smallWidth = (sourceGray.cols * template.scale).toInt();
+        final smallHeight = (sourceGray.rows * template.scale).toInt();
 
-      // 如果粗匹配置信度太低，直接返回失败（放宽一点阈值以防误判）
-      if (maxValSmall < threshold * 0.8) {
+        sourceSmall = cv.resize(sourceGray, (
+          smallWidth,
+          smallHeight,
+        ), interpolation: cv.INTER_LINEAR);
+
+        // 执行粗匹配
+        if (algorithm == MatchingAlgorithm.pyramidHybrid) {
+          // Hybrid: 使用 graySmallFilled (智能填充) + 无 Mask (启用 FFT)
+          resultSmall = cv.matchTemplate(
+            sourceSmall,
+            template.graySmallFilled,
+            cv.TM_CCOEFF_NORMED,
+            // mask: null
+          );
+        } else {
+          // PyramidMasked: 使用 graySmall + Mask
+          resultSmall = cv.matchTemplate(
+            sourceSmall,
+            template.graySmall,
+            cv.TM_CCOEFF_NORMED,
+            mask: template.maskSmall,
+          );
+        }
+
+        final minMaxSmall = cv.minMaxLoc(resultSmall!);
+        final maxValSmall = minMaxSmall.$2;
+        final maxLocSmall = minMaxSmall.$4;
+
+        // 如果粗匹配置信度太低，直接返回失败（放宽一点阈值以防误判）
+        if (maxValSmall < threshold * 0.7) {
+          // 稍微放宽一点
+          return null;
+        }
+
+        // 3. 精匹配：在原图上确定 ROI 区域
+        // 将粗匹配坐标映射回原图
+        final centerX = maxLocSmall.x / template.scale;
+        final centerY = maxLocSmall.y / template.scale;
+
+        // 定义 ROI 范围（比模板稍大一些，留出容错空间）
+        // 搜索范围扩大一些
+        final searchRange = (20 / template.scale).toInt();
+
+        final roiX = (centerX - searchRange).toInt().clamp(
+          0,
+          sourceGray.cols - template.originalWidth,
+        );
+        final roiY = (centerY - searchRange).toInt().clamp(
+          0,
+          sourceGray.rows - template.originalHeight,
+        );
+
+        // 计算实际 ROI 宽高
+        final roiW = (template.originalWidth + 2 * searchRange).clamp(
+          0,
+          sourceGray.cols - roiX,
+        );
+        final roiH = (template.originalHeight + 2 * searchRange).clamp(
+          0,
+          sourceGray.rows - roiY,
+        );
+
+        // 截取 ROI
+        roi = sourceGray.region(cv.Rect(roiX, roiY, roiW, roiH));
+
+        // 在 ROI 上进行精匹配 (始终带 Mask，保证最终精度)
+        result = cv.matchTemplate(
+          roi,
+          template.gray,
+          cv.TM_CCOEFF_NORMED,
+          mask: template.mask,
+        );
+
+        final minMax = cv.minMaxLoc(result);
+        final maxVal = minMax.$2;
+        final maxLoc = minMax.$4;
+
+        if (maxVal >= threshold) {
+          // 最终坐标 = ROI 起始坐标 + ROI 内匹配坐标
+          return MatchResult(
+            x: roiX + maxLoc.x,
+            y: roiY + maxLoc.y,
+            width: template.originalWidth,
+            height: template.originalHeight,
+            confidence: maxVal,
+          );
+        }
+
         return null;
       }
-
-      // 3. 精匹配：在原图上确定 ROI 区域
-      // 将粗匹配坐标映射回原图
-      final centerX = maxLocSmall.x / template.scale;
-      final centerY = maxLocSmall.y / template.scale;
-
-      // 定义 ROI 范围（比模板稍大一些，留出容错空间）
-      const padding = 20;
-      final startX = (centerX - padding).toInt().clamp(0, sourceGray.cols - 1);
-      final startY = (centerY - padding).toInt().clamp(0, sourceGray.rows - 1);
-
-      // 计算 ROI 宽度和高度
-      // 这里的逻辑是：我们认为目标就在 coarse 对应的位置附近
-      // 所以 ROI 只需要覆盖模板大小加上一点 padding 即可
-      // 但是为了简单起见，且因为 matchTemplate 需要遍历，
-      // 我们实际上只需要在 (centerX, centerY) 附近搜索。
-      // 标准做法是：ROI 大小 = 模板大小 + 搜索范围
-      // 比如搜索范围是 +/- 10 像素
-
-      final searchRange = (20 / template.scale).toInt(); // 搜索范围扩大一些
-
-      final roiX = (centerX - searchRange).toInt().clamp(
-        0,
-        sourceGray.cols - template.originalWidth,
-      );
-      final roiY = (centerY - searchRange).toInt().clamp(
-        0,
-        sourceGray.rows - template.originalHeight,
-      );
-
-      // ROI 的大小应该是：模板大小 + 2 * searchRange
-      // 但是为了避免越界，我们需要计算实际可用的宽高
-      final roiW = (template.originalWidth + 2 * searchRange).clamp(
-        0,
-        sourceGray.cols - roiX,
-      );
-      final roiH = (template.originalHeight + 2 * searchRange).clamp(
-        0,
-        sourceGray.rows - roiY,
-      );
-
-      // 截取 ROI
-      roi = sourceGray.region(cv.Rect(roiX, roiY, roiW, roiH));
-
-      // 在 ROI 上进行精匹配
-      result = cv.matchTemplate(
-        roi,
-        template.gray,
-        cv.TM_CCOEFF_NORMED,
-        mask: template.mask, // 传递 mask
-      );
-
-      final minMax = cv.minMaxLoc(result);
-      final maxVal = minMax.$2;
-      final maxLoc = minMax.$4;
-
-      debugPrint('Match confidence: $maxVal');
-
-      if (maxVal >= threshold) {
-        // 最终坐标 = ROI 起始坐标 + ROI 内匹配坐标
-        return MatchResult(
-          x: roiX + maxLoc.x,
-          y: roiY + maxLoc.y,
-          width: template.originalWidth,
-          height: template.originalHeight,
-          confidence: maxVal,
-        );
-      }
-
-      return null;
     } catch (e) {
       debugPrint('Error matching template: $e');
       return null;

@@ -87,6 +87,9 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   bool _isPreviewingKeep = false;
   ui.Image? _previewMaskImage;
 
+  /// 匹配算法选择
+  MatchingAlgorithm _selectedAlgorithm = MatchingAlgorithm.pyramidHybrid;
+
   /// 历史记录栈
   final List<Uint8List> _undoStack = [];
   final List<Uint8List> _redoStack = [];
@@ -310,6 +313,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
           final result = ImageMatchingService.matchTemplateWithPreload(
             image,
             _template!,
+            algorithm: _selectedAlgorithm,
           );
           matchStart.stop();
 
@@ -459,6 +463,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       final result = ImageMatchingService.matchTemplateWithPreload(
         _leftImage!,
         _template!,
+        algorithm: _selectedAlgorithm,
       );
 
       stopwatch.stop();
@@ -1305,6 +1310,60 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                               ),
                             )
                           : const Text('Find Match'),
+                    ),
+                    const SizedBox(width: 12),
+                    // 算法选择
+                    SizedBox(
+                      width: 180,
+                      child: DropdownButtonFormField<MatchingAlgorithm>(
+                        value: _selectedAlgorithm,
+                        decoration: const InputDecoration(
+                          labelText: 'Algorithm',
+                          border: OutlineInputBorder(),
+                          contentPadding: EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 0,
+                          ),
+                        ),
+                        isExpanded: true,
+                        items: const [
+                          DropdownMenuItem(
+                            value: MatchingAlgorithm.pyramidHybrid,
+                            child: Text(
+                              'Pyramid Hybrid (Fast+Mask)',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          ),
+                          DropdownMenuItem(
+                            value: MatchingAlgorithm.pyramidMasked,
+                            child: Text(
+                              'Pyramid Masked (Robust)',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          ),
+                          DropdownMenuItem(
+                            value: MatchingAlgorithm.directMasked,
+                            child: Text(
+                              'Direct Masked (Slow)',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          ),
+                          DropdownMenuItem(
+                            value: MatchingAlgorithm.directUnmasked,
+                            child: Text(
+                              'Direct Unmasked (Fastest)',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() {
+                              _selectedAlgorithm = value;
+                            });
+                          }
+                        },
+                      ),
                     ),
                   ],
                 ),
