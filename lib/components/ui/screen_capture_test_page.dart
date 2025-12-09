@@ -40,8 +40,14 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 是否正在匹配
   bool _isMatching = false;
 
+  /// 匹配耗时
+  Duration? _matchDuration;
+
   /// 左侧图片原始尺寸
   ui.Image? _leftImageObj;
+
+  /// 预处理的模板
+  ImageTemplate? _template;
 
   @override
   void initState() {
@@ -51,6 +57,12 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     if (PlatformUtils.isWindows) {
       _loadWindows();
     }
+  }
+
+  @override
+  void dispose() {
+    _template?.dispose();
+    super.dispose();
   }
 
   /// 加载运行中的窗口列表（仅 Windows）
@@ -73,6 +85,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _leftImage = bytes;
       _leftImageObj = frame.image;
       _matchResult = null; // 重置匹配结果
+      _matchDuration = null; // 重置耗时
     });
   }
 
@@ -137,15 +150,18 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
       if (result != null) {
         if (result.files.single.bytes != null) {
+          final bytes = result.files.single.bytes!;
           setState(() {
-            _rightImage = result.files.single.bytes;
+            _rightImage = bytes;
           });
+          _createTemplate(bytes);
         } else if (result.files.single.path != null) {
           final file = File(result.files.single.path!);
           final bytes = await file.readAsBytes();
           setState(() {
             _rightImage = bytes;
           });
+          _createTemplate(bytes);
         }
       }
     } catch (e) {
@@ -157,23 +173,64 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
+  /// 创建匹配模板
+  void _createTemplate(Uint8List bytes) {
+    // 释放旧模板
+    _template?.dispose();
+    _template = null;
+
+    // 创建新模板
+    final template = ImageTemplate.create(bytes);
+    if (template != null) {
+      _template = template;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Template processed and ready')),
+        );
+      }
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to create template')),
+        );
+      }
+    }
+  }
+
   /// 执行图像匹配
   Future<void> _matchImages() async {
-    if (_leftImage == null || _rightImage == null) return;
+    if (_leftImage == null || _template == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please capture screen and select image first'),
+        ),
+      );
+      return;
+    }
 
     setState(() {
       _isMatching = true;
       _matchResult = null;
+      _matchDuration = null;
     });
 
+    // 延时一帧以确保 UI 显示 Loading 状态
+    await Future.delayed(Duration.zero);
+
+    final stopwatch = Stopwatch()..start();
+
     try {
-      final result = await ImageMatchingService.matchTemplate(
+      // 在主线程直接执行，利用零拷贝优势
+      final result = ImageMatchingService.matchTemplateWithPreload(
         _leftImage!,
-        _rightImage!,
+        _template!,
       );
+
+      stopwatch.stop();
 
       setState(() {
         _matchResult = result;
+        _matchDuration = stopwatch.elapsed;
       });
 
       if (result == null && mounted) {
@@ -260,7 +317,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     ElevatedButton(
                       onPressed:
                           (_leftImage != null &&
-                              _rightImage != null &&
+                              _template != null &&
                               !_isMatching)
                           ? _matchImages
                           : null,
@@ -296,6 +353,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     image: _leftImage,
                     placeholder: 'No screen captured yet',
                     matchResult: _matchResult,
+                    matchDuration: _matchDuration,
                     imageObj: _leftImageObj,
                   ),
                 ),
@@ -328,6 +386,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     required String placeholder,
     VoidCallback? onPickImage,
     MatchResult? matchResult,
+    Duration? matchDuration,
     ui.Image? imageObj,
   }) {
     return Container(
@@ -339,12 +398,28 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  if (matchResult != null && matchDuration != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4.0),
+                      child: Text(
+                        'Time: ${matchDuration.inMilliseconds}ms\nPos: (${matchResult.x}, ${matchResult.y}) Size: ${matchResult.width}x${matchResult.height}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.blue,
+                        ),
+                      ),
+                    ),
+                ],
               ),
               if (onPickImage != null)
                 TextButton.icon(
