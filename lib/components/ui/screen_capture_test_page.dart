@@ -17,6 +17,7 @@ import 'crop_painter.dart';
 import 'draw_painter.dart';
 import 'eraser_cursor_painter.dart';
 import 'image_editor_painter.dart'; // 引入新的编辑器 Painter
+import 'keep_color_preview_painter.dart';
 
 class ScreenCaptureTestPage extends StatefulWidget {
   const ScreenCaptureTestPage({super.key});
@@ -79,6 +80,12 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     null,
   ); // 用于高性能光标更新
   final List<Offset> _eraserPathPoints = []; // 橡皮擦移动路径
+
+  /// 保留色模式相关状态
+  bool _isKeepColorMode = false;
+  final List<Color> _keepColors = [];
+  bool _isPreviewingKeep = false;
+  ui.Image? _previewMaskImage;
 
   /// 历史记录栈
   final List<Uint8List> _undoStack = [];
@@ -157,11 +164,16 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _rightImagePixels = pixelData;
 
       // 保持模式状态，不自动退出
-      if (!_isEraserMode) {
+      if (!_isEraserMode && !_isKeepColorMode) {
         _isDrawing = false;
         _drawPoints.clear();
-      } else {
+      } else if (_isEraserMode) {
         _eraserPathPoints.clear(); // 清除橡皮擦路径
+      }
+
+      if (_isPreviewingKeep) {
+        // 如果在预览时更新了图片（例如撤销），需要重新生成预览
+        _updatePreviewMask();
       }
     });
     _createTemplate(bytes);
@@ -434,6 +446,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _matchDuration = null;
       _isCropping = false; // 退出裁剪模式
       _isEraserMode = false;
+      _isKeepColorMode = false; // 退出保留色模式
+      _isPreviewingKeep = false;
       _isDrawing = false;
     });
 
@@ -483,6 +497,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _matchResult = null;
       _isDrawing = false;
       _isEraserMode = false;
+      _isKeepColorMode = false;
+      _isPreviewingKeep = false;
     });
   }
 
@@ -584,6 +600,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     setState(() {
       _isDrawing = !_isDrawing;
       _isEraserMode = false; // 互斥
+      _isKeepColorMode = false;
+      _isPreviewingKeep = false;
       _drawPoints.clear();
       _currentMousePos = null;
     });
@@ -601,9 +619,237 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     setState(() {
       _isEraserMode = !_isEraserMode;
       _isDrawing = false; // 互斥
+      _isKeepColorMode = false;
+      _isPreviewingKeep = false;
       _currentMousePos = null;
       _eraserPathPoints.clear();
     });
+  }
+
+  /// 启动/停止保留色模式
+  void _toggleKeepColorMode() {
+    if (_rightImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select an image first')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isKeepColorMode = !_isKeepColorMode;
+      _isEraserMode = false;
+      _isDrawing = false;
+      _isPreviewingKeep = false; // 退出模式时关闭预览
+      _keepColors.clear();
+      _previewMaskImage = null;
+    });
+  }
+
+  /// 添加保留色
+  void _addKeepColor(Offset pos) {
+    if (_rightImageObj == null || _keepColors.length >= 5) return;
+
+    final int cx = pos.dx.round();
+    final int cy = pos.dy.round();
+    if (cx < 0 ||
+        cx >= _rightImageObj!.width ||
+        cy < 0 ||
+        cy >= _rightImageObj!.height)
+      return;
+
+    final color = _getPixel(cx, cy);
+
+    // 避免重复添加 (简单判断)
+    for (final c in _keepColors) {
+      if (_colorDiff(c, color) < 5) return;
+    }
+
+    setState(() {
+      _keepColors.add(color);
+      // 如果正在预览，需要更新 Mask
+      if (_isPreviewingKeep) {
+        _updatePreviewMask();
+      }
+    });
+  }
+
+  /// 移除保留色
+  void _removeKeepColor(Color color) {
+    setState(() {
+      _keepColors.remove(color);
+      if (_isPreviewingKeep) {
+        _updatePreviewMask();
+      }
+    });
+  }
+
+  /// 设置预览状态
+  void _setPreviewKeep(bool active) {
+    if (_keepColors.isEmpty) return;
+    if (_isPreviewingKeep == active) return;
+
+    setState(() {
+      _isPreviewingKeep = active;
+      if (_isPreviewingKeep) {
+        _updatePreviewMask();
+      } else {
+        _previewMaskImage = null;
+      }
+    });
+  }
+
+  /// 切换预览状态
+  void _togglePreviewKeep() {
+    _setPreviewKeep(!_isPreviewingKeep);
+  }
+
+  /// 更新预览图像 (真实效果预览)
+  Future<void> _updatePreviewMask() async {
+    if (_rightImagePixels == null ||
+        _rightImageObj == null ||
+        _keepColors.isEmpty)
+      return;
+
+    final w = _rightImageObj!.width;
+    final h = _rightImageObj!.height;
+    final totalPixels = w * h;
+
+    // 创建预览图像像素数据 (RGBA)
+    // 复制原图像素，如果被剔除则设为透明
+    final previewPixels = Uint8List(totalPixels * 4);
+
+    // 阈值平方
+    final double threshold = _eraserTolerance * 2.5;
+    final double thresholdSq = threshold * threshold;
+
+    for (int i = 0; i < totalPixels; i++) {
+      final offset = i * 4;
+      final int pr = _rightImagePixels!.getUint8(offset);
+      final int pg = _rightImagePixels!.getUint8(offset + 1);
+      final int pb = _rightImagePixels!.getUint8(offset + 2);
+      final int pa = _rightImagePixels!.getUint8(offset + 3);
+
+      if (pa == 0) {
+        // 原图本来就是透明的
+        previewPixels[offset] = 0;
+        previewPixels[offset + 1] = 0;
+        previewPixels[offset + 2] = 0;
+        previewPixels[offset + 3] = 0;
+        continue;
+      }
+
+      bool keep = false;
+      for (final color in _keepColors) {
+        final int dr = pr - color.red;
+        final int dg = pg - color.green;
+        final int db = pb - color.blue;
+        final int distSq = dr * dr + dg * dg + db * db;
+
+        if (distSq <= thresholdSq) {
+          keep = true;
+          break;
+        }
+      }
+
+      if (keep) {
+        // 保留区域：复制原像素
+        previewPixels[offset] = pr;
+        previewPixels[offset + 1] = pg;
+        previewPixels[offset + 2] = pb;
+        previewPixels[offset + 3] = pa;
+      } else {
+        // 剔除区域：设为透明
+        previewPixels[offset] = 0;
+        previewPixels[offset + 1] = 0;
+        previewPixels[offset + 2] = 0;
+        previewPixels[offset + 3] = 0;
+      }
+    }
+
+    // 生成 Image
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+      previewPixels,
+    );
+    final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
+      buffer,
+      width: w,
+      height: h,
+      pixelFormat: ui.PixelFormat.rgba8888,
+    );
+    final codec = await descriptor.instantiateCodec();
+    final frame = await codec.getNextFrame();
+
+    if (mounted && _isPreviewingKeep) {
+      setState(() {
+        _previewMaskImage = frame.image;
+      });
+    }
+  }
+
+  /// 执行多色保留操作
+  Future<void> _performMultiColorKeep() async {
+    if (_rightImagePixels == null ||
+        _rightImageObj == null ||
+        _keepColors.isEmpty)
+      return;
+
+    final w = _rightImageObj!.width;
+    final h = _rightImageObj!.height;
+    final totalPixels = w * h;
+
+    final Uint8List newPixels = Uint8List.fromList(
+      _rightImagePixels!.buffer.asUint8List(),
+    );
+
+    final double threshold = _eraserTolerance * 2.5;
+    final double thresholdSq = threshold * threshold;
+    bool changed = false;
+
+    for (int i = 0; i < totalPixels; i++) {
+      final offset = i * 4;
+      final int pa = newPixels[offset + 3];
+      if (pa == 0) continue;
+
+      final int pr = newPixels[offset];
+      final int pg = newPixels[offset + 1];
+      final int pb = newPixels[offset + 2];
+
+      bool keep = false;
+      for (final color in _keepColors) {
+        final int dr = pr - color.red;
+        final int dg = pg - color.green;
+        final int db = pb - color.blue;
+        final int distSq = dr * dr + dg * dg + db * db;
+
+        if (distSq <= thresholdSq) {
+          keep = true;
+          break;
+        }
+      }
+
+      if (!keep) {
+        newPixels[offset + 3] = 0; // 设为透明
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await _updatePixels(newPixels, w, h);
+      // 操作完成后退出模式
+      setState(() {
+        _isKeepColorMode = false;
+        _keepColors.clear();
+        _isPreviewingKeep = false;
+        _previewMaskImage = null;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Kept selected colors, removed others.'),
+          ),
+        );
+      }
+    }
   }
 
   /// 磁性套索：寻找吸附点
@@ -1158,7 +1404,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
                         const Divider(indent: 8, endIndent: 8),
 
-                        // 橡皮擦按钮菜单 (使用 MenuAnchor 或 PopupMenuButton 包含 Slider)
+                        // 橡皮擦按钮菜单
                         PopupMenuButton<void>(
                           tooltip: 'Eraser Size',
                           icon: Icon(
@@ -1172,27 +1418,9 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                 ? Colors.purple.withOpacity(0.1)
                                 : null,
                           ),
-
-                          // 点击图标直接切换模式
-                          // 为了实现"点击切换模式，长按或点击箭头调大小"，这里稍微变通一下
-                          // PopupMenuButton 默认点击就打开菜单。
-                          // 我们让它点击打开菜单，菜单里有 Slider 和 模式切换说明?
-                          // 或者简单的: 既然用户主要想调大小，点击就打开大小调节器。
-                          // 如果想切换模式，可以在菜单里选? 或者保留点击行为是切换模式?
-                          // 这里的实现：点击图标打开菜单，菜单里有 Slider。
-                          // 另外单独加一个按钮切换模式? 不，用户习惯是点击图标切换模式。
-                          // 我们把 Slider 放在 PopupMenu 里，但是需要保持菜单不关闭?
-                          // 更好的方式：使用 GestureDetector 包裹图标，点击切换模式，长按弹出 Slider?
-                          // 或者：点击图标 -> 切换模式。
-                          // 右边加一个小箭头 -> 弹出 Slider。
-                          // 现在的实现：PopupMenuButton 占用一个图标位。
-                          // 我们改为：点击图标 -> 切换模式。
-                          // 图标下面(或旁边)加一个 Slider? 空间不够。
-                          // 遵循用户要求：改用 Slider 来确定大小。
-                          // 可以在点击后弹出的菜单中放 Slider。
                           itemBuilder: (context) => [
                             PopupMenuItem<void>(
-                              enabled: false, // 不可点击关闭
+                              enabled: false,
                               child: StatefulBuilder(
                                 builder: (context, setState) {
                                   return SizedBox(
@@ -1209,7 +1437,6 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                             setState(() {
                                               _eraserSize = value;
                                             });
-                                            // 同步更新外部状态
                                             this.setState(() {
                                               _eraserSize = value;
                                               if (!_isEraserMode) {
@@ -1226,17 +1453,115 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                             ),
                           ],
                           onOpened: () {
-                            // 打开菜单时自动切换到橡皮擦模式
                             if (!_isEraserMode) {
                               _toggleEraserMode();
                             }
                           },
                         ),
 
-                        if (_isEraserMode) ...[
+                        const SizedBox(height: 16),
+
+                        // 保留色工具按钮
+                        Tooltip(
+                          message: 'Keep Colors (Filter)',
+                          child: IconButton(
+                            onPressed: _toggleKeepColorMode,
+                            icon: const Icon(Icons.invert_colors),
+                            color: _isKeepColorMode
+                                ? Colors.green
+                                : Colors.black54,
+                            style: IconButton.styleFrom(
+                              backgroundColor: _isKeepColorMode
+                                  ? Colors.green.withOpacity(0.1)
+                                  : null,
+                            ),
+                          ),
+                        ),
+
+                        // 保留色模式下的额外控件
+                        if (_isKeepColorMode) ...[
                           const SizedBox(height: 8),
-                          // 容差调整 (用简单的 Popup 或 Dialog 可能更好，这里尝试放在 tooltip 或直接 icon 交互)
-                          // 为了简单，我们加一个设置按钮来调容差
+                          // 1. 已选颜色列表
+                          Wrap(
+                            spacing: 4,
+                            runSpacing: 4,
+                            children: _keepColors
+                                .map(
+                                  (c) => GestureDetector(
+                                    onTap: () => _removeKeepColor(c),
+                                    child: Container(
+                                      width: 20,
+                                      height: 20,
+                                      decoration: BoxDecoration(
+                                        color: c,
+                                        border: Border.all(color: Colors.grey),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: const Icon(
+                                        Icons.close,
+                                        size: 12,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                                .toList(),
+                          ),
+                          const SizedBox(height: 8),
+
+                          // 2. 预览按钮
+                          Tooltip(
+                            message: 'Preview (Hold to view)',
+                            child: GestureDetector(
+                              onTapDown: _keepColors.isNotEmpty
+                                  ? (_) => _setPreviewKeep(true)
+                                  : null,
+                              onTapUp: _keepColors.isNotEmpty
+                                  ? (_) => _setPreviewKeep(false)
+                                  : null,
+                              onTapCancel: _keepColors.isNotEmpty
+                                  ? () => _setPreviewKeep(false)
+                                  : null,
+                              child: Container(
+                                padding: const EdgeInsets.all(8.0),
+                                decoration: BoxDecoration(
+                                  color: _isPreviewingKeep
+                                      ? Colors.blue.withOpacity(0.1)
+                                      : Colors.transparent,
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  _isPreviewingKeep
+                                      ? Icons.visibility
+                                      : Icons.visibility_off,
+                                  color: _keepColors.isNotEmpty
+                                      ? (_isPreviewingKeep
+                                            ? Colors.blue
+                                            : Colors.black54)
+                                      : Colors.grey,
+                                ),
+                              ),
+                            ),
+                          ),
+
+                          // 3. 应用按钮
+                          Tooltip(
+                            message: 'Apply Filter',
+                            child: IconButton(
+                              onPressed: _keepColors.isNotEmpty
+                                  ? _performMultiColorKeep
+                                  : null,
+                              icon: const Icon(Icons.check_circle),
+                              color: _keepColors.isNotEmpty
+                                  ? Colors.green
+                                  : Colors.grey,
+                            ),
+                          ),
+                        ],
+
+                        if (_isEraserMode || _isKeepColorMode) ...[
+                          const SizedBox(height: 8),
+                          // 容差调整 (共享)
                           Tooltip(
                             message: 'Tolerance: ${_eraserTolerance.round()}',
                             child: IconButton(
@@ -1245,7 +1570,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                 showDialog(
                                   context: context,
                                   builder: (ctx) => AlertDialog(
-                                    title: const Text('Eraser Tolerance'),
+                                    title: const Text('Tolerance'),
                                     content: StatefulBuilder(
                                       builder: (ctx, setDialogState) {
                                         return Column(
@@ -1262,6 +1587,11 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                                 });
                                                 setState(() {
                                                   _eraserTolerance = v;
+                                                  // 如果正在预览保留色，实时更新
+                                                  if (_isKeepColorMode &&
+                                                      _isPreviewingKeep) {
+                                                    _updatePreviewMask();
+                                                  }
                                                 });
                                               },
                                             ),
@@ -1554,7 +1884,14 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                     eraserSize: _eraserSize,
                                     positionNotifier: _mousePosNotifier,
                                   )
-                                : null,
+                                : (_isKeepColorMode &&
+                                          !isLeft &&
+                                          imageObj != null
+                                      ? KeepColorPreviewPainter(
+                                          image: imageObj,
+                                          maskImage: _previewMaskImage,
+                                        )
+                                      : null),
                             foregroundPainter: _isCropping && isLeft
                                 ? CropPainter(
                                     image: imageObj,
@@ -1579,6 +1916,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                                               )
                                             : null)),
                             child: (_isEraserMode && !isLeft)
+                                ? const SizedBox.expand()
+                                : (_isPreviewingKeep && !isLeft)
                                 ? const SizedBox.expand()
                                 : Image.memory(image, fit: BoxFit.contain),
                           ),
@@ -1648,6 +1987,20 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                               onPanEnd: (details) {
                                 _extractIcon();
                               },
+                              child: content,
+                            ),
+                          );
+                        } else if (!isLeft && _isKeepColorMode) {
+                          // 保留色模式逻辑
+                          return MouseRegion(
+                            cursor: SystemMouseCursors.click, // 或者吸管图标
+                            child: GestureDetector(
+                              onTapUp: (details) {
+                                final p = toImage(details.localPosition);
+                                _addKeepColor(p);
+                              },
+                              onLongPressStart: (_) => _setPreviewKeep(true),
+                              onLongPressEnd: (_) => _setPreviewKeep(false),
                               child: content,
                             ),
                           );
