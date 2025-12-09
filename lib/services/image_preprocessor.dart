@@ -69,4 +69,70 @@ class ImagePreprocessor {
     invMask.dispose();
     return result;
   }
+
+  /// 图像二值化
+  /// [src] 输入图像 (BGRA 或 BGR)
+  /// [threshold] 阈值 (0-255)，如果 useOtsu 为 true 则忽略此值
+  /// [useOtsu] 是否使用 Otsu 自动阈值
+  /// [inverse] 是否反转二值化结果 (黑变白，白变黑)
+  static cv.Mat binarizeImage(
+    cv.Mat src, {
+    double threshold = 127,
+    bool useOtsu = false,
+    bool inverse = false,
+  }) {
+    cv.Mat gray;
+    cv.Mat? alphaMask;
+
+    // 1. 转灰度并提取 Alpha
+    if (src.channels == 4) {
+      final channels = cv.split(src);
+      alphaMask = channels[3];
+      gray = cv.cvtColor(src, cv.COLOR_BGRA2GRAY);
+      channels[0].dispose();
+      channels[1].dispose();
+      channels[2].dispose();
+    } else {
+      if (src.channels == 3) {
+        gray = cv.cvtColor(src, cv.COLOR_BGR2GRAY);
+      } else {
+        gray = src.clone();
+      }
+    }
+
+    try {
+      // 2. 处理 Alpha 通道：将透明区域设为黑色 (0)
+      if (alphaMask != null) {
+        // 创建反向 Mask (透明区域为 255)
+        final all255 = cv.Mat.zeros(
+          alphaMask.rows,
+          alphaMask.cols,
+          alphaMask.type,
+        );
+        all255.setTo(cv.Scalar(255, 0, 0, 0));
+        final invAlpha = cv.subtract(all255, alphaMask);
+        all255.dispose();
+
+        // 将透明区域设为黑 (0)
+        // 注意：这里假设背景是黑色的。如果希望二值化时忽略背景，这步很关键。
+        gray.setTo(cv.Scalar(0, 0, 0, 0), mask: invAlpha);
+        invAlpha.dispose();
+      }
+
+      // 3. 应用二值化
+      int type = inverse ? cv.THRESH_BINARY_INV : cv.THRESH_BINARY;
+      if (useOtsu) {
+        type |= cv.THRESH_OTSU;
+      }
+
+      final result = cv.threshold(gray, threshold, 255, type);
+
+      // result.$1 是计算出的阈值 (如果用了 Otsu)，result.$2 是图像
+      // 我们只需要图像
+      return result.$2;
+    } finally {
+      gray.dispose();
+      alphaMask?.dispose();
+    }
+  }
 }

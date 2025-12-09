@@ -593,6 +593,117 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
+  /// 执行二值化预处理
+  Future<void> _performBinarize() async {
+    if (_rightImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select an image first')),
+      );
+      return;
+    }
+
+    // 显示配置对话框
+    double threshold = 127;
+    bool useOtsu = false;
+    bool inverse = false;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Binarize Image'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CheckboxListTile(
+                    title: const Text('Use Otsu (Auto Threshold)'),
+                    value: useOtsu,
+                    onChanged: (v) {
+                      setDialogState(() {
+                        useOtsu = v ?? false;
+                      });
+                    },
+                  ),
+                  if (!useOtsu) ...[
+                    const SizedBox(height: 8),
+                    Text('Threshold: ${threshold.round()}'),
+                    Slider(
+                      value: threshold,
+                      min: 0,
+                      max: 255,
+                      divisions: 255,
+                      onChanged: (v) {
+                        setDialogState(() {
+                          threshold = v;
+                        });
+                      },
+                    ),
+                  ],
+                  CheckboxListTile(
+                    title: const Text('Inverse (Black <-> White)'),
+                    value: inverse,
+                    onChanged: (v) {
+                      setDialogState(() {
+                        inverse = v ?? false;
+                      });
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Apply'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (confirmed != true) return;
+
+    try {
+      final mat = cv.imdecode(_rightImage!, cv.IMREAD_UNCHANGED);
+      if (mat.isEmpty) return;
+
+      final processedMat = ImagePreprocessor.binarizeImage(
+        mat,
+        threshold: threshold,
+        useOtsu: useOtsu,
+        inverse: inverse,
+      );
+
+      final success = cv.imencode('.png', processedMat);
+
+      mat.dispose();
+      processedMat.dispose();
+
+      if (success.$1) {
+        await _updateRightImage(success.$2, pushToUndo: true);
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Binarization applied')));
+        }
+      }
+    } catch (e) {
+      debugPrint('Binarize error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Error binarizing image: $e')));
+      }
+    }
+  }
+
   /// 启动/停止绘制模式
   void _toggleDrawMode() {
     if (_rightImage == null) {
@@ -1457,6 +1568,15 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                             onPressed: _performSmartPreprocess,
                             icon: const Icon(Icons.auto_fix_high),
                             color: Colors.blue,
+                          ),
+                        ),
+                        // 二值化按钮
+                        Tooltip(
+                          message: 'Binarize (Black & White)',
+                          child: IconButton(
+                            onPressed: _performBinarize,
+                            icon: const Icon(Icons.contrast),
+                            color: Colors.black87,
                           ),
                         ),
                         const SizedBox(height: 16),
