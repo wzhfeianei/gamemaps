@@ -40,6 +40,9 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 是否正在匹配
   bool _isMatching = false;
 
+  /// 是否正在连续截图
+  bool _isContinuousCapturing = false;
+
   /// 匹配耗时
   Duration? _matchDuration;
 
@@ -61,6 +64,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
   @override
   void dispose() {
+    _isContinuousCapturing = false; // 停止连续截图
     _template?.dispose();
     super.dispose();
   }
@@ -137,6 +141,94 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
         setState(() {
           _isCapturing = false;
         });
+      }
+    }
+  }
+
+  /// 连续截图并对比（仅 Windows）
+  Future<void> _continuousCaptureAndMatch() async {
+    if (!PlatformUtils.isWindows || _selectedWindow == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select a window first')),
+      );
+      return;
+    }
+
+    if (_template == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select a template image first')),
+      );
+      return;
+    }
+
+    if (_isContinuousCapturing) {
+      // 如果正在运行，则停止
+      setState(() {
+        _isContinuousCapturing = false;
+      });
+      return;
+    }
+
+    setState(() {
+      _isContinuousCapturing = true;
+    });
+
+    while (_isContinuousCapturing && mounted) {
+      final stopwatch = Stopwatch()..start();
+
+      try {
+        // 1. 截图
+        final image = await ScreenCaptureService.captureWindow(
+          _selectedWindow!,
+        );
+        if (image != null) {
+          // 更新界面显示截图
+          // 注意：_updateLeftImage 会调用 setState，这可能会导致界面刷新频繁
+          // 为了性能，我们这里手动更新部分状态，不完全依赖 _updateLeftImage
+
+          final codec = await ui.instantiateImageCodec(image);
+          final frame = await codec.getNextFrame();
+
+          if (!mounted || !_isContinuousCapturing) break;
+
+          setState(() {
+            _leftImage = image;
+            _leftImageObj = frame.image;
+          });
+
+          // 2. 对比
+          // 确保不阻塞 UI
+          await Future.delayed(Duration.zero);
+
+          final matchStart = Stopwatch()..start();
+          final result = ImageMatchingService.matchTemplateWithPreload(
+            image,
+            _template!,
+          );
+          matchStart.stop();
+
+          if (!mounted || !_isContinuousCapturing) break;
+
+          setState(() {
+            _matchResult = result;
+            _matchDuration = matchStart.elapsed;
+          });
+        }
+      } catch (e) {
+        debugPrint('Continuous capture error: $e');
+        // 出错后暂停一下，避免死循环刷错误
+        await Future.delayed(const Duration(seconds: 1));
+      }
+
+      stopwatch.stop();
+      // 计算需要等待的时间，确保间隔至少 30ms
+      final elapsed = stopwatch.elapsedMilliseconds;
+      final waitTime = 30 - elapsed;
+      if (waitTime > 0) {
+        await Future.delayed(Duration(milliseconds: waitTime.toInt()));
+      } else {
+        // 如果处理时间超过 30ms，则只稍微让出一点时间给 UI
+        await Future.delayed(const Duration(milliseconds: 1));
       }
     }
   }
@@ -305,6 +397,24 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                         child: _isCapturing
                             ? const CircularProgressIndicator()
                             : const Text('Capture Window'),
+                      ),
+                      const SizedBox(width: 12),
+                      ElevatedButton(
+                        onPressed:
+                            (_selectedWindow != null && _template != null)
+                            ? _continuousCaptureAndMatch
+                            : null,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _isContinuousCapturing
+                              ? Colors.red
+                              : null,
+                          foregroundColor: _isContinuousCapturing
+                              ? Colors.white
+                              : null,
+                        ),
+                        child: Text(
+                          _isContinuousCapturing ? 'Stop Auto' : 'Auto Capture',
+                        ),
                       ),
                     ],
                     const SizedBox(width: 12),
