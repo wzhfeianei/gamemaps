@@ -10,6 +10,7 @@ import '../../services/screen_capture_service.dart';
 import '../../utils/platform_utils.dart';
 
 import 'match_painter.dart';
+import 'crop_painter.dart';
 
 class ScreenCaptureTestPage extends StatefulWidget {
   const ScreenCaptureTestPage({super.key});
@@ -21,8 +22,10 @@ class ScreenCaptureTestPage extends StatefulWidget {
 class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 左侧截图结果
   Uint8List? _leftImage;
+  ui.Image? _leftImageObj;
+  ByteData? _leftImagePixels; // RGBA 像素数据
 
-  /// 右侧指定图片（这里使用一个默认的 Flutter 图标）
+  /// 右侧指定图片
   Uint8List? _rightImage;
 
   /// 运行中的窗口列表（仅 Windows）
@@ -31,7 +34,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 选中的窗口名称
   String? _selectedWindow;
 
-  /// 是否正在截图
+  /// 是否正在截图（全屏/窗口）
   bool _isCapturing = false;
 
   /// 匹配结果
@@ -46,11 +49,14 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 匹配耗时
   Duration? _matchDuration;
 
-  /// 左侧图片原始尺寸
-  ui.Image? _leftImageObj;
-
   /// 预处理的模板
   ImageTemplate? _template;
+
+  /// 裁剪相关状态
+  bool _isCropping = false;
+  Offset? _cropStart; // 图片坐标系
+  Offset? _cropEnd; // 图片坐标系
+  Offset? _currentMousePos; // 图片坐标系
 
   @override
   void initState() {
@@ -85,11 +91,21 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   Future<void> _updateLeftImage(Uint8List bytes) async {
     final codec = await ui.instantiateImageCodec(bytes);
     final frame = await codec.getNextFrame();
+    final pixelData = await frame.image.toByteData(
+      format: ui.ImageByteFormat.rawRgba,
+    );
+
     setState(() {
       _leftImage = bytes;
       _leftImageObj = frame.image;
+      _leftImagePixels = pixelData;
       _matchResult = null; // 重置匹配结果
       _matchDuration = null; // 重置耗时
+      // 如果正在裁剪，重置裁剪状态但保持模式（如果需要）
+      // 这里假设重新截图后退出裁剪模式
+      _isCropping = false;
+      _cropStart = null;
+      _cropEnd = null;
     });
   }
 
@@ -162,7 +178,6 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
 
     if (_isContinuousCapturing) {
-      // 如果正在运行，则停止
       setState(() {
         _isContinuousCapturing = false;
       });
@@ -177,17 +192,14 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       final stopwatch = Stopwatch()..start();
 
       try {
-        // 1. 截图
         final image = await ScreenCaptureService.captureWindow(
           _selectedWindow!,
         );
         if (image != null) {
-          // 更新界面显示截图
-          // 注意：_updateLeftImage 会调用 setState，这可能会导致界面刷新频繁
-          // 为了性能，我们这里手动更新部分状态，不完全依赖 _updateLeftImage
-
           final codec = await ui.instantiateImageCodec(image);
           final frame = await codec.getNextFrame();
+          // 注意：连续截图中我们可能不需要实时获取 pixelData，除非需要实时放大镜
+          // 为了性能暂不获取 pixelData
 
           if (!mounted || !_isContinuousCapturing) break;
 
@@ -196,8 +208,6 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
             _leftImageObj = frame.image;
           });
 
-          // 2. 对比
-          // 确保不阻塞 UI
           await Future.delayed(Duration.zero);
 
           final matchStart = Stopwatch()..start();
@@ -216,24 +226,21 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
         }
       } catch (e) {
         debugPrint('Continuous capture error: $e');
-        // 出错后暂停一下，避免死循环刷错误
         await Future.delayed(const Duration(seconds: 1));
       }
 
       stopwatch.stop();
-      // 计算需要等待的时间，确保间隔至少 30ms
       final elapsed = stopwatch.elapsedMilliseconds;
       final waitTime = 30 - elapsed;
       if (waitTime > 0) {
         await Future.delayed(Duration(milliseconds: waitTime.toInt()));
       } else {
-        // 如果处理时间超过 30ms，则只稍微让出一点时间给 UI
         await Future.delayed(const Duration(milliseconds: 1));
       }
     }
   }
 
-  /// 选择并显示左侧图片（模拟截图）
+  /// 选择并显示左侧图片
   Future<void> _pickLeftImage() async {
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
@@ -258,7 +265,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
-  /// 选择并显示指定图片
+  /// 选择并显示指定图片（右侧）
   Future<void> _pickImage() async {
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
@@ -266,15 +273,15 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       );
 
       if (result != null) {
+        Uint8List? bytes;
         if (result.files.single.bytes != null) {
-          final bytes = result.files.single.bytes!;
-          setState(() {
-            _rightImage = bytes;
-          });
-          _createTemplate(bytes);
+          bytes = result.files.single.bytes!;
         } else if (result.files.single.path != null) {
           final file = File(result.files.single.path!);
-          final bytes = await file.readAsBytes();
+          bytes = await file.readAsBytes();
+        }
+
+        if (bytes != null) {
           setState(() {
             _rightImage = bytes;
           });
@@ -290,13 +297,10 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
-  /// 创建匹配模板
   void _createTemplate(Uint8List bytes) {
-    // 释放旧模板
     _template?.dispose();
     _template = null;
 
-    // 创建新模板
     final template = ImageTemplate.create(bytes);
     if (template != null) {
       _template = template;
@@ -329,15 +333,14 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       _isMatching = true;
       _matchResult = null;
       _matchDuration = null;
+      _isCropping = false; // 退出裁剪模式
     });
 
-    // 延时一帧以确保 UI 显示 Loading 状态
     await Future.delayed(Duration.zero);
 
     final stopwatch = Stopwatch()..start();
 
     try {
-      // 在主线程直接执行，利用零拷贝优势
       final result = ImageMatchingService.matchTemplateWithPreload(
         _leftImage!,
         _template!,
@@ -364,13 +367,69 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     }
   }
 
+  /// 启动裁剪模式
+  void _startCropMode() {
+    if (_leftImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please capture/select an image first')),
+      );
+      return;
+    }
+    setState(() {
+      _isCropping = true;
+      _cropStart = null;
+      _cropEnd = null;
+      _matchResult = null;
+    });
+  }
+
+  /// 确认裁剪
+  Future<void> _confirmCrop() async {
+    if (_leftImageObj == null || _cropStart == null || _cropEnd == null) return;
+
+    // 计算规范化的矩形
+    final rect = Rect.fromPoints(_cropStart!, _cropEnd!);
+    if (rect.width < 1 || rect.height < 1) return;
+
+    try {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+
+      // 绘制子图
+      canvas.drawImageRect(
+        _leftImageObj!,
+        rect,
+        Rect.fromLTWH(0, 0, rect.width, rect.height),
+        Paint(),
+      );
+
+      final picture = recorder.endRecording();
+      final img = await picture.toImage(
+        rect.width.toInt(),
+        rect.height.toInt(),
+      );
+      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+
+      if (byteData != null) {
+        final bytes = byteData.buffer.asUint8List();
+        setState(() {
+          _rightImage = bytes;
+          _isCropping = false;
+        });
+        _createTemplate(bytes);
+      }
+    } catch (e) {
+      debugPrint('Crop error: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Screen Capture Test')),
       body: Column(
         children: [
-          // 控制按钮区域
+          // 1. 控制面板
           Padding(
             padding: const EdgeInsets.all(16.0),
             child: Column(
@@ -397,6 +456,10 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                           decoration: const InputDecoration(
                             labelText: 'Select Window',
                             border: OutlineInputBorder(),
+                            contentPadding: EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 0,
+                            ),
                           ),
                           items: _windows.map((window) {
                             return DropdownMenuItem(
@@ -471,7 +534,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
             ),
           ),
 
-          // 主要内容区域：左右分栏
+          // 2. 图片显示区域
           Expanded(
             child: Row(
               children: [
@@ -483,11 +546,11 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     placeholder: 'No screen captured yet',
                     matchResult: _matchResult,
                     imageObj: _leftImageObj,
-                    onPickImage: _pickLeftImage, // 添加选择图片功能
+                    onPickImage: _pickLeftImage,
+                    isLeft: true,
                   ),
                 ),
 
-                // 分隔线
                 const VerticalDivider(width: 1, color: Colors.grey),
 
                 // 右侧：指定图片
@@ -496,7 +559,6 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     title: 'Specified Image',
                     image: _rightImage,
                     placeholder: 'No specified image',
-                    // 这里可以添加加载指定图片的逻辑
                     onPickImage: _pickImage,
                   ),
                 ),
@@ -504,7 +566,50 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
             ),
           ),
 
-          // 底部信息栏
+          // 3. 图片处理工具栏 (新加)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: Colors.grey[100],
+            child: Row(
+              children: [
+                const Text(
+                  'Tools: ',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(width: 10),
+                ElevatedButton.icon(
+                  onPressed: _isCropping ? null : _startCropMode,
+                  icon: const Icon(Icons.crop),
+                  label: const Text('Screenshot / Crop'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isCropping ? Colors.green : null,
+                    foregroundColor: _isCropping ? Colors.white : null,
+                  ),
+                ),
+                if (_isCropping) ...[
+                  const SizedBox(width: 10),
+                  const Text(
+                    'Drag on left image to crop. Release to confirm.',
+                    style: TextStyle(color: Colors.green),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        _isCropping = false;
+                        _cropStart = null;
+                        _cropEnd = null;
+                      });
+                    },
+                    child: const Text('Cancel'),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+
+          // 4. 底部信息栏
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(12.0),
@@ -565,6 +670,7 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     VoidCallback? onPickImage,
     MatchResult? matchResult,
     ui.Image? imageObj,
+    bool isLeft = false,
   }) {
     return Container(
       padding: const EdgeInsets.all(16.0),
@@ -598,22 +704,97 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                 borderRadius: BorderRadius.circular(8),
                 color: Colors.white,
               ),
+              clipBehavior: Clip.hardEdge,
               child: image != null
                   ? LayoutBuilder(
                       builder: (context, constraints) {
-                        return CustomPaint(
-                          foregroundPainter: matchResult != null
-                              ? MatchPainter(
-                                  matchResult: matchResult,
-                                  imageObj: imageObj,
-                                )
-                              : null,
-                          child: SizedBox(
-                            width: constraints.maxWidth,
-                            height: constraints.maxHeight,
+                        // 如果没有 imageObj，直接显示图片，不支持高级绘制功能
+                        if (imageObj == null) {
+                          return Image.memory(image, fit: BoxFit.contain);
+                        }
+
+                        final imgW = imageObj.width.toDouble();
+                        final imgH = imageObj.height.toDouble();
+
+                        // 计算 BoxFit.contain 的布局
+                        final scaleX = constraints.maxWidth / imgW;
+                        final scaleY = constraints.maxHeight / imgH;
+                        final scale = scaleX < scaleY ? scaleX : scaleY;
+
+                        final displayW = imgW * scale;
+                        final displayH = imgH * scale;
+
+                        // 偏移量
+                        final dx = (constraints.maxWidth - displayW) / 2;
+                        final dy = (constraints.maxHeight - displayH) / 2;
+
+                        Offset toImage(Offset p) {
+                          return Offset(
+                            (p.dx - dx) / scale,
+                            (p.dy - dy) / scale,
+                          );
+                        }
+
+                        // 如果是左侧且正在裁剪，使用 MouseRegion + GestureDetector
+                        // 否则只是显示
+                        Widget content = SizedBox(
+                          width: constraints.maxWidth,
+                          height: constraints.maxHeight,
+                          child: CustomPaint(
+                            painter: _isCropping && isLeft
+                                ? null // 裁剪时使用 foregroundPainter 覆盖
+                                : null,
+                            foregroundPainter: _isCropping && isLeft
+                                ? CropPainter(
+                                    image: imageObj!,
+                                    start: _cropStart,
+                                    end: _cropEnd,
+                                    currentPos: _currentMousePos,
+                                    pixelData: _leftImagePixels,
+                                  )
+                                : (matchResult != null
+                                      ? MatchPainter(
+                                          matchResult: matchResult,
+                                          imageObj: imageObj,
+                                        )
+                                      : null),
                             child: Image.memory(image, fit: BoxFit.contain),
                           ),
                         );
+
+                        if (isLeft && _isCropping) {
+                          return MouseRegion(
+                            cursor: SystemMouseCursors.precise,
+                            onHover: (event) {
+                              setState(() {
+                                _currentMousePos = toImage(event.localPosition);
+                              });
+                            },
+                            child: GestureDetector(
+                              onPanStart: (details) {
+                                final p = toImage(details.localPosition);
+                                setState(() {
+                                  _cropStart = p;
+                                  _cropEnd = p;
+                                  _currentMousePos = p;
+                                });
+                              },
+                              onPanUpdate: (details) {
+                                final p = toImage(details.localPosition);
+                                setState(() {
+                                  _cropEnd = p;
+                                  _currentMousePos = p;
+                                });
+                              },
+                              onPanEnd: (details) {
+                                _confirmCrop();
+                              },
+                              child: content,
+                            ),
+                          );
+                        } else {
+                          return content;
+                        }
                       },
                     )
                   : Center(
