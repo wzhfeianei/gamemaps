@@ -1,11 +1,15 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import '../../services/image_matching_service.dart';
 import '../../services/screen_capture_service.dart';
 import '../../utils/platform_utils.dart';
+
+import 'match_painter.dart';
 
 class ScreenCaptureTestPage extends StatefulWidget {
   const ScreenCaptureTestPage({super.key});
@@ -30,6 +34,15 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
   /// 是否正在截图
   bool _isCapturing = false;
 
+  /// 匹配结果
+  MatchResult? _matchResult;
+
+  /// 是否正在匹配
+  bool _isMatching = false;
+
+  /// 左侧图片原始尺寸
+  ui.Image? _leftImageObj;
+
   @override
   void initState() {
     super.initState();
@@ -53,6 +66,16 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     });
   }
 
+  Future<void> _updateLeftImage(Uint8List bytes) async {
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    setState(() {
+      _leftImage = bytes;
+      _leftImageObj = frame.image;
+      _matchResult = null; // 重置匹配结果
+    });
+  }
+
   /// 截取当前屏幕
   Future<void> _captureScreen() async {
     setState(() {
@@ -61,9 +84,9 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
     try {
       final image = await ScreenCaptureService.captureScreen();
-      setState(() {
-        _leftImage = image;
-      });
+      if (image != null) {
+        await _updateLeftImage(image);
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -88,9 +111,9 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
 
     try {
       final image = await ScreenCaptureService.captureWindow(_selectedWindow!);
-      setState(() {
-        _leftImage = image;
-      });
+      if (image != null) {
+        await _updateLeftImage(image);
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -127,9 +150,48 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Failed to pick image')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Failed to pick image')));
+      }
+    }
+  }
+
+  /// 执行图像匹配
+  Future<void> _matchImages() async {
+    if (_leftImage == null || _rightImage == null) return;
+
+    setState(() {
+      _isMatching = true;
+      _matchResult = null;
+    });
+
+    try {
+      final result = await ImageMatchingService.matchTemplate(
+        _leftImage!,
+        _rightImage!,
+      );
+
+      setState(() {
+        _matchResult = result;
+      });
+
+      if (result == null && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('No match found')));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Error matching images: $e')));
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isMatching = false;
+        });
       }
     }
   }
@@ -194,6 +256,29 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                             : const Text('Capture Window'),
                       ),
                     ],
+                    const SizedBox(width: 12),
+                    ElevatedButton(
+                      onPressed:
+                          (_leftImage != null &&
+                              _rightImage != null &&
+                              !_isMatching)
+                          ? _matchImages
+                          : null,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                      ),
+                      child: _isMatching
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Text('Find Match'),
+                    ),
                   ],
                 ),
               ],
@@ -210,6 +295,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     title: 'Captured Screen',
                     image: _leftImage,
                     placeholder: 'No screen captured yet',
+                    matchResult: _matchResult,
+                    imageObj: _leftImageObj,
                   ),
                 ),
 
@@ -240,6 +327,8 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     required Uint8List? image,
     required String placeholder,
     VoidCallback? onPickImage,
+    MatchResult? matchResult,
+    ui.Image? imageObj,
   }) {
     return Container(
       padding: const EdgeInsets.all(16.0),
@@ -252,7 +341,10 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
             children: [
               Text(
                 title,
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
               if (onPickImage != null)
                 TextButton.icon(
@@ -271,7 +363,23 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                 color: Colors.white,
               ),
               child: image != null
-                  ? Center(child: Image.memory(image, fit: BoxFit.contain))
+                  ? LayoutBuilder(
+                      builder: (context, constraints) {
+                        return CustomPaint(
+                          foregroundPainter: matchResult != null
+                              ? MatchPainter(
+                                  matchResult: matchResult,
+                                  imageObj: imageObj,
+                                )
+                              : null,
+                          child: SizedBox(
+                            width: constraints.maxWidth,
+                            height: constraints.maxHeight,
+                            child: Image.memory(image, fit: BoxFit.contain),
+                          ),
+                        );
+                      },
+                    )
                   : Center(
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
