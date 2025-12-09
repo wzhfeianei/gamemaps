@@ -232,12 +232,6 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
         _matchResult = result;
         _matchDuration = stopwatch.elapsed;
       });
-
-      if (result == null && mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('No match found')));
-      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -353,7 +347,6 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
                     image: _leftImage,
                     placeholder: 'No screen captured yet',
                     matchResult: _matchResult,
-                    matchDuration: _matchDuration,
                     imageObj: _leftImageObj,
                   ),
                 ),
@@ -374,6 +367,55 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
               ],
             ),
           ),
+
+          // 底部信息栏
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12.0),
+            color: Colors.grey[200],
+            child: Row(
+              children: [
+                const Icon(Icons.info_outline, size: 20, color: Colors.blue),
+                const SizedBox(width: 8),
+                Text(
+                  _matchDuration != null
+                      ? 'Time: ${_matchDuration!.inMilliseconds}ms'
+                      : 'Time: --',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(width: 20),
+                if (_matchResult != null) ...[
+                  Text(
+                    'Position: (${_matchResult!.x}, ${_matchResult!.y})',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(width: 20),
+                  Text(
+                    'Size: ${_matchResult!.width}x${_matchResult!.height}',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(width: 20),
+                  Text(
+                    'Confidence: ${(_matchResult!.confidence * 100).toStringAsFixed(1)}%',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ] else if (_matchDuration != null) ...[
+                  const Text(
+                    'Result: No match found',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.red,
+                    ),
+                  ),
+                ] else ...[
+                  const Text(
+                    'Ready to match',
+                    style: TextStyle(color: Colors.grey),
+                  ),
+                ],
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -386,7 +428,6 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
     required String placeholder,
     VoidCallback? onPickImage,
     MatchResult? matchResult,
-    Duration? matchDuration,
     ui.Image? imageObj,
   }) {
     return Container(
@@ -398,28 +439,12 @@ class _ScreenCaptureTestPageState extends State<ScreenCaptureTestPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  if (matchResult != null && matchDuration != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 4.0),
-                      child: Text(
-                        'Time: ${matchDuration.inMilliseconds}ms\nPos: (${matchResult.x}, ${matchResult.y}) Size: ${matchResult.width}x${matchResult.height}',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.blue,
-                        ),
-                      ),
-                    ),
-                ],
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
               if (onPickImage != null)
                 TextButton.icon(
