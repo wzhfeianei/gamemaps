@@ -1,5 +1,8 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 import 'dart:convert';
+import 'package:file_picker/file_picker.dart';
 import '../../services/script_engine_service.dart';
 import 'widgets/script_editor.dart';
 
@@ -111,6 +114,62 @@ class _ScriptTestPageState extends State<ScriptTestPage> {
                         await _editorKey.currentState?.setText(t);
                       },
                       child: const Text('示例：httpGet'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: () async {
+                        final t =
+                            '/* 示例3：compareImages(路径+阈值) */\n(async () => {\n  const r = await compareImages(\'D:\\\\1.png\', \'D:\\\\2.png\', 0.85);\n  console.log(JSON.stringify(r));\n  return r.ok ? r.score : r.reason;\n})()';
+                        await _editorKey.currentState?.setText(t);
+                      },
+                      child: const Text('示例：compareImages'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: () async {
+                        final resTpl = await FilePicker.platform.pickFiles(
+                          type: FileType.image,
+                        );
+                        final resTgt = await FilePicker.platform.pickFiles(
+                          type: FileType.image,
+                        );
+                        final tpl = resTpl?.files.single.path;
+                        final tgt = resTgt?.files.single.path;
+                        print(tpl);
+                        if (tpl != null && tgt != null) {
+                          final r = await _engine.compareImagesFromPath(
+                            tpl,
+                            tgt,
+                            0.85,
+                          );
+                          setState(() {
+                            _result = jsonEncode(r);
+                          });
+                        }
+                      },
+                      child: const Text('本地对比'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: () async {
+                        final prelude = [
+                          '/* 类型声明（用于提示与高亮） */',
+                          '/** @type {(a:number,b:number)=>number} */',
+                          'function sum(a,b) { return 0; }',
+                          '/** @type {(url:string)=>Promise<string>} */',
+                          'async function httpGet(url) { return \"\"; }',
+                          '/** @type {(templatePath:string,targetPath:string,minScore?:number)=>Promise<{ok:boolean,score:number,rect?:{x:number,y:number,w:number,h:number},reason?:string}>} */',
+                          'async function compareImages(templatePath,targetPath,minScore) { return {ok:false,score:0}; }',
+                          '',
+                        ].join('\n');
+                        final existing =
+                            await _editorKey.currentState?.getText() ??
+                            _defaultCode;
+                        await _editorKey.currentState?.setText(
+                          prelude + existing,
+                        );
+                      },
+                      child: const Text('注入类型提示'),
                     ),
                   ],
                 ),
